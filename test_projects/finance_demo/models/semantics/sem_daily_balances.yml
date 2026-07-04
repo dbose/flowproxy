@@ -1,0 +1,76 @@
+version: 2
+
+# ---------------------------------------------------------------------------
+# Semi-additive semantic model — the WS1 guardrail centerpiece (ADR-0003).
+#
+# eod_balance is a point-in-time balance: you may SUM it across accounts on a
+# given day, but you must NOT sum it across days. Over a month you want the
+# LAST (max metric_time) daily value, not the ~30-day total.
+#
+# `non_additive_dimension` is how MetricFlow encodes exactly that guardrail.
+# Because the proxy re-plans every request through MetricFlow (never passes BI
+# SQL through raw), a BI tool emitting SUM("eod_balance") cannot defeat it.
+# ---------------------------------------------------------------------------
+semantic_models:
+  - name: daily_balances
+    description: "End-of-day account balances at (account, day) grain."
+    model: ref('fct_daily_balances')
+
+    defaults:
+      agg_time_dimension: balance_date
+
+    # primary_entity names the entity this model's measures aggregate over,
+    # without asserting account is unique per row (the grain is account×day).
+    # Account *attributes* still come solely from the accounts dimension model.
+    primary_entity: account
+
+    entities:
+      - name: account
+        type: foreign
+        expr: account_id
+
+    dimensions:
+      - name: balance_date
+        type: time
+        type_params:
+          time_granularity: day
+      # region / account_name are NOT declared here — they live on the
+      # `accounts` dimension model (sem_accounts.yml) and are reached via the
+      # shared `account` entity. Declaring them here too would give MetricFlow
+      # two join paths to the same attribute.
+
+    measures:
+      # Semi-additive: last value within the time window, summed across the
+      # non-time grain (accounts). This is the account-balance / MRR pattern.
+      - name: month_end_balance
+        description: "End-of-period balance (semi-additive over time)."
+        agg: sum
+        expr: eod_balance
+        agg_time_dimension: balance_date
+        non_additive_dimension:
+          name: balance_date
+          window_choice: max
+
+      # Contrast measure: naive sum across all days (intentionally "wrong" for
+      # a balance). Used by the golden test to prove the guardrail changes the
+      # number — the semi-additive metric must NOT equal this.
+      - name: naive_balance_sum
+        description: "SUM of eod_balance across all days (NOT a valid balance)."
+        agg: sum
+        expr: eod_balance
+        agg_time_dimension: balance_date
+
+metrics:
+  - name: account_balance
+    label: "Account Balance (EOP)"
+    description: "Semi-additive end-of-period account balance."
+    type: simple
+    type_params:
+      measure: month_end_balance
+
+  - name: naive_balance_total
+    label: "Naive Balance Sum"
+    description: "Diagnostic: sum of daily balances across the period."
+    type: simple
+    type_params:
+      measure: naive_balance_sum

@@ -1,0 +1,88 @@
+# FlowProxy semantic-layer CI/CD (WS7e, ADR-0013).
+#
+# PRs & pushes:   run the OFFLINE validate gate (no warehouse, no publish).
+# Production release ONLY (a published GitHub Release): validate AND publish the
+#   bundle to the ManifestStore, which the running proxies then hot-swap.
+#
+# The gate is plan-only (MetricFlow explain) — it needs no warehouse credentials,
+# so it runs on every PR safely.
+
+name: semantic-layer
+
+on:
+  pull_request:
+    paths:
+      - "test_projects/**"
+      - "models/**"
+      - "**/sem_*.yml"
+      - "**/saved_queries.yml"
+  push:
+    branches: [main]
+  release:
+    types: [published]        # ← the ONLY event that publishes to production
+
+env:
+  DO_NOT_TRACK: "1"
+  DBT_SEND_ANONYMOUS_USAGE_STATS: "false"
+  # dbt project under version control (adjust to your repo layout):
+  DBT_PROJECT_DIR: test_projects/finance_demo
+
+jobs:
+  validate:
+    name: Validate semantic layer (plan-only gate)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Sync deps
+        run: uv sync --extra duckdb
+
+      # Parse the MetricFlow YAML into a semantic manifest. Uses a throwaway
+      # DuckDB profile so `dbt parse` runs without production warehouse creds.
+      - name: dbt parse
+        working-directory: ${{ env.DBT_PROJECT_DIR }}
+        run: uv run --project ${{ github.workspace }} dbt parse --profiles-dir .
+
+      # The gate: plan every saved query + auto-cube. Fails the job on any
+      # broken join path / renamed dimension / missing metric.
+      - name: Validate gate (no publish)
+        run: |
+          uv run python -m flowproxy_cli validate ${{ env.DBT_PROJECT_DIR }} --diff
+
+  publish:
+    name: Publish bundle to ManifestStore (production release only)
+    needs: validate
+    if: github.event_name == 'release'          # ← gate on production release
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write                            # for OIDC to the object store
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - run: uv sync --extra duckdb
+
+      - name: dbt parse
+        working-directory: ${{ env.DBT_PROJECT_DIR }}
+        run: uv run --project ${{ github.workspace }} dbt parse --profiles-dir .
+
+      # Assume the object-store role via OIDC (no long-lived keys in CI).
+      # Replace with your cloud's auth action (aws-actions/configure-aws-credentials,
+      # google-github-actions/auth, azure/login, or Artifactory token).
+      # - uses: aws-actions/configure-aws-credentials@v4
+      #   with:
+      #     role-to-assume: ${{ secrets.FLOWPROXY_PUBLISH_ROLE }}
+      #     aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Validate + publish bundle
+        env:
+          FLOWPROXY_MANIFEST_URI: ${{ vars.FLOWPROXY_MANIFEST_URI }}   # e.g. s3://bank-artifacts/flowproxy/production/
+        run: |
+          uv run python -m flowproxy_cli validate ${{ env.DBT_PROJECT_DIR }} \
+            --publish "$FLOWPROXY_MANIFEST_URI" \
+            --profiles-template ${{ env.DBT_PROJECT_DIR }}/profiles.template.yml \
+            --git-sha "${{ github.sha }}" \
+            --built-at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --diff

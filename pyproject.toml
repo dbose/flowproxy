@@ -1,0 +1,40 @@
+[project]
+name = "flowproxy"
+version = "0.1.0"
+description = "Self-hosted semantic proxy over dbt-core + MetricFlow, speaking the PostgreSQL wire protocol to QuickSight and Power BI"
+readme = "README.md"
+requires-python = ">=3.11,<3.13"
+
+# Runtime dependencies. dbt-core / dbt-semantic-interfaces / metricflow /
+# dbt-metricflow move in lockstep (ADR-0002); upgrade together + re-run dbt parse.
+dependencies = [
+    "dbt-core==1.11.12",
+    "dbt-semantic-interfaces==0.9.0",
+    "metricflow==0.211.0",
+    "dbt-metricflow==0.13.0",
+    "sqlglot>=26,<27",
+    "uvloop>=0.21; sys_platform != 'win32'",
+    "mcp>=1.28.1",
+    "fsspec>=2026.6.0",
+]
+
+[project.optional-dependencies]
+# Air-gapped warehouse for CI + local golden-numbers tests (ADR-0003).
+duckdb = [
+    "dbt-duckdb>=1.9,<1.12",
+    "duckdb>=1.1",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+    "pytest-asyncio>=0.24",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.uv]
+# Air-gap posture: no build isolation surprises, reproducible resolution.
+package = false

@@ -1,0 +1,40 @@
+# FlowProxy — semantic proxy over dbt MetricFlow
+#
+# GENERATED reference pins. The authoritative source is pyproject.toml; run
+#   uv export --extra duckdb --no-hashes -o requirements.txt
+# to regenerate. For air-gapped installs, vendor the full resolved set
+# (uv.lock) through your internal mirror.
+#
+# Phase 1 matrix, resolved and verified against the real index (ADR-0002):
+# dbt-core 1.11.12  +  metricflow 0.211.0  +  dbt-metricflow 0.13.0
+# +  dbt-semantic-interfaces 0.9.0. These move in lockstep — upgrade together
+# and re-run `dbt parse`.
+
+# --- semantic layer core ----------------------------------------------------
+dbt-core==1.11.12
+dbt-semantic-interfaces==0.9.0
+metricflow==0.211.0
+dbt-metricflow==0.13.0
+
+# --- warehouse adapters -----------------------------------------------------
+# DuckDB backs the air-gapped test harness (ADR-0003) and works as a real
+# local warehouse. Enable the production adapter(s) you deploy against.
+dbt-duckdb==1.10.1
+# dbt-snowflake==1.9.*
+# dbt-redshift==1.9.*
+
+# --- SQL parsing ------------------------------------------------------------
+sqlglot==26.33.0
+
+# --- manifest store (WS7) — fsspec covers s3/gs/az/file/http in one backend --
+fsspec==2026.6.0
+# Enable the extras your store needs (vendored via the internal mirror):
+# s3fs   ==…   # s3://
+# gcsfs  ==…   # gs://
+# adlfs  ==…   # az://
+
+# --- embedded MCP server (LLM access) ---------------------------------------
+mcp==1.28.1
+
+# --- async networking -------------------------------------------------------
+uvloop==0.22.1; sys_platform != "win32"

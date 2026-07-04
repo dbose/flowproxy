@@ -1,0 +1,20 @@
+# profiles.template.yml — the adapter SHAPE published in the bundle (ADR-0012).
+# Contains NO secrets. At runtime FlowProxy injects credentials via env-var
+# interpolation ({{ env_var(...) }}), populated by the enterprise secret store.
+#
+# The top-level key IS the profile name; the runtime skeleton's dbt_project.yml
+# is generated to reference it.
+flowproxy_runtime:
+  target: prod
+  outputs:
+    prod:
+      type: duckdb
+      # DuckDB demo: path from env. A real warehouse would interpolate creds:
+      #   type: snowflake
+      #   account: "{{ env_var('SNOWFLAKE_ACCOUNT') }}"
+      #   user: "{{ env_var('SNOWFLAKE_USER') }}"
+      #   password: "{{ env_var('SNOWFLAKE_PASSWORD') }}"
+      #   ...
+      path: "{{ env_var('FLOWPROXY_DUCKDB_PATH') }}"
+      threads: 4
+      schema: main

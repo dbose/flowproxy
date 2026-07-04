@@ -1,0 +1,57 @@
+version: 2
+
+# Fully additive semantic model. Provides a second model joined to the same
+# `account` entity, so the golden suite also exercises MetricFlow's join-path
+# planning (dimensions from one model reachable across the entity graph).
+semantic_models:
+  - name: transactions
+    description: "Individual account transactions (fully additive amount)."
+    model: ref('fct_transactions')
+
+    defaults:
+      agg_time_dimension: transaction_date
+
+    entities:
+      - name: transaction
+        type: primary
+        expr: transaction_id
+      - name: account
+        type: foreign
+        expr: account_id
+
+    dimensions:
+      - name: transaction_date
+        type: time
+        type_params:
+          time_granularity: day
+      - name: transaction_type
+        type: categorical
+      # region / account_name reached via the `account` entity join to the
+      # `accounts` dimension model — not duplicated here (see sem_accounts.yml).
+
+    measures:
+      - name: total_amount
+        description: "Sum of transaction amounts (additive)."
+        agg: sum
+        expr: amount
+        agg_time_dimension: transaction_date
+      - name: transaction_count
+        description: "Count of transactions."
+        agg: count
+        expr: transaction_id
+        agg_time_dimension: transaction_date
+
+metrics:
+  - name: total_transactions
+    label: "Total Transaction Amount"
+    description: "Total value of transactions."
+    type: simple
+    type_params:
+      measure: total_amount
+
+  - name: transaction_count
+    label: "Transaction Count"
+    description: "Number of transactions."
+    type: simple
+    type_params:
+      measure: transaction_count

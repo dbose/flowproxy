@@ -1,0 +1,11 @@
+# Self-contained DuckDB profile for the air-gapped test harness (ADR-0003).
+# The DuckDB file lives inside target/ so `dbt clean` wipes it and each run
+# starts from seeds — deterministic golden numbers.
+finance_demo:
+  target: dev
+  outputs:
+    dev:
+      type: duckdb
+      path: "{{ env_var('FLOWPROXY_DUCKDB_PATH', 'target/finance_demo.duckdb') }}"
+      threads: 4
+      schema: main

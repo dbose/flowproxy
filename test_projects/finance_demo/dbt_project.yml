@@ -1,0 +1,27 @@
+name: "finance_demo"
+version: "1.0.0"
+config-version: 2
+
+# WS1 fixture project (ADR-0003): a real dbt-core 1.11 project with MetricFlow
+# semantic models exercising the non_additive_dimension (semi-additive) guardrail.
+profile: "finance_demo"
+
+model-paths: ["models"]
+seed-paths: ["seeds"]
+target-path: "target"
+clean-targets: ["target", "dbt_packages"]
+
+# Air-gap hygiene (ADR-0002): never phone home.
+flags:
+  send_anonymous_usage_stats: false
+
+models:
+  finance_demo:
+    staging:
+      +materialized: view
+    marts:
+      +materialized: table
+
+seeds:
+  finance_demo:
+    +quote_columns: false

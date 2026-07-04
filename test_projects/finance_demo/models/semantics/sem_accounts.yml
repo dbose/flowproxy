@@ -1,0 +1,30 @@
+version: 2
+
+# Account dimension semantic model. Account attributes (region, name) live
+# HERE — on the model where `account` is the primary entity — not duplicated
+# onto the fact models. This is the correct MetricFlow pattern: it gives every
+# metric anchored to the `account` entity a single, unambiguous join path to
+# these dimensions and avoids fan-out double-counting when a fact joins a
+# higher-grain table.
+semantic_models:
+  - name: accounts
+    description: "Account dimension: one row per account."
+    model: ref('stg_accounts')
+
+    defaults:
+      agg_time_dimension: opened_on
+
+    entities:
+      - name: account
+        type: primary
+        expr: account_id
+
+    dimensions:
+      - name: region
+        type: categorical
+      - name: account_name
+        type: categorical
+      - name: opened_on
+        type: time
+        type_params:
+          time_granularity: day

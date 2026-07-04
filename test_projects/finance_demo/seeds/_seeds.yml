@@ -1,0 +1,24 @@
+version: 2
+
+seeds:
+  - name: raw_accounts
+    config:
+      column_types:
+        account_id: integer
+        account_name: varchar
+        region: varchar
+        opened_on: date
+  - name: raw_daily_balances
+    config:
+      column_types:
+        account_id: integer
+        balance_date: date
+        eod_balance: double
+  - name: raw_transactions
+    config:
+      column_types:
+        transaction_id: integer
+        account_id: integer
+        transaction_date: date
+        amount: double
+        transaction_type: varchar

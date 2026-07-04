@@ -1,0 +1,13 @@
+transaction_id,account_id,transaction_date,amount,transaction_type
+1,1001,2024-01-05,100.0,deposit
+2,1001,2024-01-15,100.0,deposit
+3,1001,2024-01-25,100.0,deposit
+4,2002,2024-01-10,200.0,deposit
+5,2002,2024-01-20,300.0,deposit
+6,1001,2024-02-08,150.0,deposit
+7,1001,2024-02-18,100.0,withdrawal
+8,2002,2024-02-14,400.0,deposit
+9,1001,2024-03-03,500.0,deposit
+10,2002,2024-03-11,300.0,deposit
+11,2002,2024-03-21,300.0,deposit
+12,2002,2024-03-31,300.0,withdrawal

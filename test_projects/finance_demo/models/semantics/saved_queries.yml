@@ -1,0 +1,26 @@
+version: 2
+
+# Saved queries become governed, always-valid virtual tables in the catalog
+# (ADR-0004 mechanics; ADR-0010 keeps them alongside the auto-cubes). The CI
+# deploy gate (WS7) dry-run-plans each of these on every manifest change.
+saved_queries:
+  - name: monthly_balance_by_region
+    label: "Monthly Account Balance by Region"
+    description: "Certified: semi-additive end-of-period balance, monthly, by region."
+    query_params:
+      metrics:
+        - account_balance
+      group_by:
+        - Dimension('account__region')
+        - TimeDimension('metric_time', 'month')
+
+  - name: monthly_transactions_by_region
+    label: "Monthly Transactions by Region"
+    description: "Certified: total transaction amount + count, monthly, by region."
+    query_params:
+      metrics:
+        - total_transactions
+        - transaction_count
+      group_by:
+        - Dimension('account__region')
+        - TimeDimension('metric_time', 'month')
