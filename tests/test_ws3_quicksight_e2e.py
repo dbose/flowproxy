@@ -278,3 +278,33 @@ async def test_quicksight_tables_probe_extended_protocol(server):
     names = {r[0] for r in rows}
     assert "daily_balances" in names and "all_metrics" in names
     writer.close()
+
+
+@pytest.mark.asyncio
+async def test_count_of_dimension_returns_guided_error(server):
+    """QuickSight emits COUNT(<dimension>) when a visual has no measure. The
+    parser unwraps the COUNT (aggregation lives in the metric), leaving zero
+    metrics, which MetricFlow cannot plan. Instead of an opaque SQL exception,
+    the analyst gets a guided error naming the available metrics - and the
+    connection survives for the next (correct) query."""
+    reader, writer = await _connect()
+    writer.write(_query(
+        'SELECT "account__region", COUNT("metric_time") AS c '
+        'FROM "daily_balances" GROUP BY 1'
+    ))
+    await writer.drain()
+    msgs = await _read_until_ready(reader)
+    tags = [t for t, _ in msgs]
+    assert b"E" in tags, f"expected ErrorResponse, got {tags}"
+    err = next(p for t, p in msgs if t == b"E")
+    assert b"0A000" in err                       # feature_not_supported (clean error)
+    assert b"no metric" in err or b"metric" in err
+
+    # Connection still usable: a proper metric query works right after.
+    writer.write(_query(
+        'SELECT "account__region", "account_balance" FROM "daily_balances" GROUP BY 1'
+    ))
+    await writer.drain()
+    cols, rows = _rows_from(await _read_until_ready(reader))
+    assert "account_balance" in cols
+    writer.close()

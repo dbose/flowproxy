@@ -145,6 +145,26 @@ class SQLExtractor:
 
         cube = self._extract_cube(tree)
         metrics, dimensions = self._classify_projections(tree)
+
+        # A semantic query must request at least one metric. QuickSight (and
+        # other BI tools) can emit COUNT(<dimension>) when a visual has no
+        # measure - our parser correctly unwraps the COUNT (aggregation lives in
+        # the metric definition, not the SQL), leaving zero metrics. MetricFlow
+        # cannot plan a metric-less query, so guide the analyst rather than
+        # emit an opaque SQL exception. Matches dbt Cloud's behavior.
+        if not metrics:
+            available = sorted(self._registry.metrics)
+            hint = ", ".join(available[:8]) + ("..." if len(available) > 8 else "")
+            raise UnsupportedQueryError(
+                "this visual has no metric - the semantic layer answers metrics, "
+                "not counts of dimensions",
+                detail=(
+                    f"Add a metric to the visual's Value field (available: {hint}). "
+                    "COUNT of a dimension is not supported; define a count metric in "
+                    "the semantic model if you need one."
+                ),
+            )
+
         clauses = self._translator.translate(tree)  # WS2: WHERE/ORDER/LIMIT
 
         result = ExtractedQuery(
