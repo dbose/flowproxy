@@ -147,6 +147,24 @@ _OID_TO_JDBC_TYPE: dict[int, int] = {
     20: -5, 701: 8, 1700: 2, 1043: 12, 1082: 91, 1114: 93,
 }
 
+# Real PostgreSQL defaults for the GUCs a JDBC driver probes via pg_settings
+# during metadata calls. max_index_keys is the one QuickSight blocks on; the
+# rest are here so we answer the whole family, not one at a time.
+_PG_SETTINGS_DEFAULTS: dict[str, str] = {
+    "max_index_keys": "32",
+    "max_identifier_length": "63",
+    "block_size": "8192",
+    "integer_datetimes": "on",
+    "standard_conforming_strings": "on",
+    "server_version": "15.4",
+    "server_encoding": "UTF8",
+    "client_encoding": "UTF8",
+    "DateStyle": "ISO, MDY",
+    "TimeZone": "UTC",
+    "max_function_args": "100",
+}
+
+
 # Column names the pg_attribute RowSet carries: raw pg_attribute + the JDBC
 # getColumns() output shape, so the projection resolves either.
 _PG_ATTRIBUTE_COLS: list[str] = [
@@ -176,6 +194,7 @@ class CatalogResponder:
             ("information_schema.tables", self._answer_is_tables),
             ("information_schema.columns", self._answer_is_columns),
             ("information_schema.schemata", self._answer_is_schemata),
+            ("pg_settings", self._answer_pg_settings),
             ("pg_type", self._answer_pg_type_stub),
             ("pg_attribute", self._answer_pg_attribute),
             ("pg_class", self._answer_pg_class),
@@ -395,6 +414,30 @@ class CatalogResponder:
                         and isinstance(val, exp.Literal) and val.is_string:
                     return val.this.replace("\\", "")
         return None
+
+    def _answer_pg_settings(self, sql: str) -> RowSet:
+        """pg_catalog.pg_settings lookups (SELECT setting FROM pg_settings
+        WHERE name = 'X'). JDBC drivers probe these during getColumns/
+        getPrimaryKeys (e.g. max_index_keys) and do rs.next(); rs.getInt(1) -
+        an empty result THROWS. So every such probe must return >= 1 row.
+
+        Known settings return real PostgreSQL defaults; an unknown setting
+        returns a single row with an empty value rather than 0 rows, so the
+        driver never chokes (generic - no chipping away one setting at a time).
+        """
+        name = self._extract_setting_name(sql)
+        value = _PG_SETTINGS_DEFAULTS.get(name, "") if name is not None else ""
+        # Provide the columns pg_settings probes commonly select/alias.
+        cols = ["name", "setting", "unit", "category", "short_desc",
+                "vartype", "source", "min_val", "max_val", "boot_val", "reset_val"]
+        row = (name or "", value, None, "FlowProxy", "", "string",
+               "default", None, None, value, value)
+        return RowSet(columns=cols, rows=[row])
+
+    @staticmethod
+    def _extract_setting_name(sql: str) -> str | None:
+        m = re.search(r"name\s*=\s*'([^']+)'", sql, re.IGNORECASE)
+        return m.group(1) if m else None
 
     def _answer_pg_type_stub(self, sql: str) -> CatalogResult | None:
         """Power BI / Npgsql pg_type composite bootstrap — DEFERRED stub.

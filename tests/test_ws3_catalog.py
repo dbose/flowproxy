@@ -274,3 +274,24 @@ def test_powerbi_pg_type_bootstrap_is_deferred_stub(responder):
     # Deferred: empty + unhandled so it's visibly a stub, not a real answer.
     assert not r.handled
     assert r.rows == []
+
+
+def test_pg_settings_max_index_keys(responder):
+    """The exact probe QuickSight blocks on. JDBC does rs.next(); rs.getInt(1),
+    so it MUST get exactly one row - an empty result throws and aborts the
+    whole getColumns/getPrimaryKeys sequence."""
+    r = responder.answer(
+        "SELECT setting FROM pg_catalog.pg_settings WHERE name='max_index_keys'"
+    )
+    assert r.handled
+    assert r.columns == ["setting"]
+    assert len(r.rows) == 1
+    assert r.rows[0][0] == "32"          # PostgreSQL default
+
+
+def test_pg_settings_unknown_returns_one_row(responder):
+    """An unknown GUC still returns one row (empty value), never zero - so the
+    driver never chokes, and we don't chip away at settings one at a time."""
+    r = responder.answer("SELECT setting FROM pg_settings WHERE name='some_guc'")
+    assert r.handled
+    assert len(r.rows) == 1
