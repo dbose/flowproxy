@@ -308,3 +308,27 @@ async def test_count_of_dimension_returns_guided_error(server):
     cols, rows = _rows_from(await _read_until_ready(reader))
     assert "account_balance" in cols
     writer.close()
+
+
+@pytest.mark.asyncio
+async def test_quicksight_generated_column_aliases(server):
+    """QuickSight aliases every output column to a generated token and reads the
+    result set back BY that alias, e.g.
+      SELECT account__region AS "daily_bal-account__-12afe2",
+             SUM(account_balance) AS "sum_bal_x9" ...
+    The wire RowDescription must use those aliases, not the semantic names, or
+    QuickSight finds no matching column and renders NULL NULL. Regression."""
+    reader, writer = await _connect()
+    writer.write(_query(
+        'SELECT "account__region" AS "daily_bal-account__-12afe2", '
+        'SUM("account_balance") AS "sum_bal_x9" '
+        'FROM "semantic_layer"."daily_balances" '
+        'GROUP BY 1 ORDER BY "account__region" LIMIT 500'
+    ))
+    await writer.drain()
+    cols, rows = _rows_from(await _read_until_ready(reader))
+    # The RowDescription carries QuickSight's aliases, not account__region.
+    assert cols == ["daily_bal-account__-12afe2", "sum_bal_x9"], cols
+    vals = {r[0]: float(r[1]) for r in rows}
+    assert vals == {"EMEA": 2000.0, "AMER": 3000.0}   # correct, non-null
+    writer.close()
