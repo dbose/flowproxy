@@ -208,7 +208,7 @@ def _materialize_skeleton(
 class DimensionInfo:
     """A group-by dimension with catalog metadata (WS3/MCP)."""
 
-    name: str                       # qualified, grain-free: account__region, metric_time
+    name: str                       # qualified, grain-free: <entity>__<dim>, metric_time
     dimension_type: str             # categorical | time | unknown
     label: str | None = None
     description: str | None = None
@@ -483,7 +483,7 @@ class SemanticCompiler:
 
         This is MetricFlow's linkable-elements resolution — the *reachable*
         dimensions across the entity join graph, not just locally-defined
-        ones. Returns qualified names (``account__region``, ``metric_time``)
+        ones. Returns qualified names (``<entity>__<dim>``, ``metric_time``)
         with labels/descriptions/types for catalog metadata.
 
         Consumed by:

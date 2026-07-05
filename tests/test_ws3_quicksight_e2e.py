@@ -55,11 +55,17 @@ async def _read_until_ready(reader: asyncio.StreamReader) -> list[tuple[bytes, b
 
 
 def _rows_from(msgs: list[tuple[bytes, bytes]]) -> tuple[list[str], list[list[str]]]:
-    """Decode RowDescription 'T' column names + DataRow 'D' text values."""
+    """Decode RowDescription 'T' column names + DataRow 'D' text values.
+
+    The extended protocol may send two RowDescriptions (Describe-statement and
+    Describe-portal); the one that describes the rows is the LAST before the
+    DataRows, so each 'T' resets the column list (last wins) - what a driver does.
+    """
     cols: list[str] = []
     rows: list[list[str]] = []
     for tag, payload in msgs:
         if tag == b"T":
+            cols = []
             n = struct.unpack_from("!H", payload, 0)[0]
             pos = 2
             for _ in range(n):
@@ -190,4 +196,139 @@ async def test_quicksight_filtered_slice(server):
     balances = [float(r[bi]) for r in rows]
     # EMEA monthly end-of-period balances only.
     assert balances == [1500.0, 1200.0, 2000.0]
+    writer.close()
+
+
+# --------------------------------------------------------------------------- #
+# Extended query protocol (Parse/Bind/Describe/Execute) - the path QuickSight's
+# JDBC driver actually uses. The simple 'Q' path above did NOT exercise this,
+# which is how the catalog-over-extended-protocol bug slipped through.
+# --------------------------------------------------------------------------- #
+def _parse(stmt: str, sql: str) -> bytes:
+    body = stmt.encode() + b"\x00" + sql.encode() + b"\x00" + struct.pack("!H", 0)
+    return b"P" + struct.pack("!I", len(body) + 4) + body
+
+
+def _describe(kind: bytes, name: str) -> bytes:
+    body = kind + name.encode() + b"\x00"
+    return b"D" + struct.pack("!I", len(body) + 4) + body
+
+
+def _bind(portal: str, stmt: str) -> bytes:
+    # no param formats, no params, no result formats
+    body = portal.encode() + b"\x00" + stmt.encode() + b"\x00"
+    body += struct.pack("!H", 0) + struct.pack("!H", 0) + struct.pack("!H", 0)
+    return b"B" + struct.pack("!I", len(body) + 4) + body
+
+
+def _execute(portal: str, max_rows: int = 0) -> bytes:
+    body = portal.encode() + b"\x00" + struct.pack("!I", max_rows)
+    return b"E" + struct.pack("!I", len(body) + 4) + body
+
+
+def _sync() -> bytes:
+    return b"S" + struct.pack("!I", 4)
+
+
+@pytest.mark.asyncio
+async def test_quicksight_catalog_probe_extended_protocol(server):
+    """The getSchemas probe over the extended protocol (Parse/Describe/Bind/
+    Execute), exactly as QuickSight's JDBC driver sends it. Regression for the
+    'Parsed but never completed' catalog bug: the extended path must Describe a
+    RowDescription (not NoData) and Execute real rows."""
+    reader, writer = await _connect()
+    sql = "SELECT nspname AS schema_name FROM pg_namespace WHERE nspname NOT LIKE 'pg_%'"
+    writer.write(_parse("st1", sql))
+    writer.write(_describe(b"S", "st1"))   # Describe statement (asks column shape)
+    writer.write(_bind("p1", "st1"))
+    writer.write(_describe(b"P", "p1"))    # Describe portal
+    writer.write(_execute("p1"))
+    writer.write(_sync())
+    await writer.drain()
+
+    msgs = await _read_until_ready(reader)
+    tags = [t for t, _ in msgs]
+    # Must include a RowDescription 'T' (not just 'n' NoData) and DataRows 'D'.
+    assert b"T" in tags, f"no RowDescription in extended catalog reply: {tags}"
+    assert b"D" in tags, f"no DataRows in extended catalog reply: {tags}"
+
+    cols, rows = _rows_from(msgs)
+    assert cols == ["schema_name"], f"alias not honored: {cols}"
+    assert "semantic_layer" in {r[0] for r in rows}
+    writer.close()
+
+
+@pytest.mark.asyncio
+async def test_quicksight_tables_probe_extended_protocol(server):
+    """information_schema.tables over the extended protocol returns the cubes."""
+    reader, writer = await _connect()
+    sql = ("SELECT table_name FROM information_schema.tables "
+           "WHERE table_schema = 'semantic_layer'")
+    writer.write(_parse("st2", sql))
+    writer.write(_bind("p2", "st2"))
+    writer.write(_describe(b"P", "p2"))
+    writer.write(_execute("p2"))
+    writer.write(_sync())
+    await writer.drain()
+
+    msgs = await _read_until_ready(reader)
+    assert b"T" in [t for t, _ in msgs]
+    cols, rows = _rows_from(msgs)
+    assert cols == ["table_name"]
+    names = {r[0] for r in rows}
+    assert "daily_balances" in names and "all_metrics" in names
+    writer.close()
+
+
+@pytest.mark.asyncio
+async def test_count_of_dimension_returns_guided_error(server):
+    """QuickSight emits COUNT(<dimension>) when a visual has no measure. The
+    parser unwraps the COUNT (aggregation lives in the metric), leaving zero
+    metrics, which MetricFlow cannot plan. Instead of an opaque SQL exception,
+    the analyst gets a guided error naming the available metrics - and the
+    connection survives for the next (correct) query."""
+    reader, writer = await _connect()
+    writer.write(_query(
+        'SELECT "account__region", COUNT("metric_time") AS c '
+        'FROM "daily_balances" GROUP BY 1'
+    ))
+    await writer.drain()
+    msgs = await _read_until_ready(reader)
+    tags = [t for t, _ in msgs]
+    assert b"E" in tags, f"expected ErrorResponse, got {tags}"
+    err = next(p for t, p in msgs if t == b"E")
+    assert b"0A000" in err                       # feature_not_supported (clean error)
+    assert b"no metric" in err or b"metric" in err
+
+    # Connection still usable: a proper metric query works right after.
+    writer.write(_query(
+        'SELECT "account__region", "account_balance" FROM "daily_balances" GROUP BY 1'
+    ))
+    await writer.drain()
+    cols, rows = _rows_from(await _read_until_ready(reader))
+    assert "account_balance" in cols
+    writer.close()
+
+
+@pytest.mark.asyncio
+async def test_quicksight_generated_column_aliases(server):
+    """QuickSight aliases every output column to a generated token and reads the
+    result set back BY that alias, e.g.
+      SELECT account__region AS "daily_bal-account__-12afe2",
+             SUM(account_balance) AS "sum_bal_x9" ...
+    The wire RowDescription must use those aliases, not the semantic names, or
+    QuickSight finds no matching column and renders NULL NULL. Regression."""
+    reader, writer = await _connect()
+    writer.write(_query(
+        'SELECT "account__region" AS "daily_bal-account__-12afe2", '
+        'SUM("account_balance") AS "sum_bal_x9" '
+        'FROM "semantic_layer"."daily_balances" '
+        'GROUP BY 1 ORDER BY "account__region" LIMIT 500'
+    ))
+    await writer.drain()
+    cols, rows = _rows_from(await _read_until_ready(reader))
+    # The RowDescription carries QuickSight's aliases, not account__region.
+    assert cols == ["daily_bal-account__-12afe2", "sum_bal_x9"], cols
+    vals = {r[0]: float(r[1]) for r in rows}
+    assert vals == {"EMEA": 2000.0, "AMER": 3000.0}   # correct, non-null
     writer.close()

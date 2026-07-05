@@ -55,16 +55,20 @@ COPY --chown=flowproxy:flowproxy network/ ./network/
 COPY --chown=flowproxy:flowproxy executor/ ./executor/
 COPY --chown=flowproxy:flowproxy mcpserver/ ./mcpserver/
 COPY --chown=flowproxy:flowproxy flowproxy_cli/ ./flowproxy_cli/
-COPY --chown=flowproxy:flowproxy main.py ./
-RUN chown -R flowproxy:flowproxy /app
+COPY --chown=flowproxy:flowproxy main.py docker-entrypoint.sh ./
+RUN chmod +x /app/docker-entrypoint.sh \
+ && mkdir -p /app/data \
+ && chown -R flowproxy:flowproxy /app
 
 USER flowproxy
 EXPOSE 5432
 
-# pg_isready speaks the real startup protocol — a true end-to-end liveness probe.
+# pg_isready speaks the real startup protocol - a true end-to-end liveness probe.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
   CMD pg_isready -h 127.0.0.1 -p 5432 -U healthcheck || exit 1
 
-# Consume-from-store: no dbt parse, no project mount. main.py chooses STORE mode
-# when FLOWPROXY_MANIFEST_URI is set, else DIRECT mode (local dev).
-ENTRYPOINT ["python", "/app/main.py"]
+# STORE mode with a DuckDB sidecar (ADR-0016): the entrypoint downloads the
+# .duckdb from FLOWPROXY_DUCKDB_URI, then execs main.py, which pulls the manifest
+# bundle from FLOWPROXY_MANIFEST_URI. S3 access uses s3fs (installed via the
+# `aws` extra); no AWS CLI in the image, to keep it slim.
+ENTRYPOINT ["/app/docker-entrypoint.sh"]

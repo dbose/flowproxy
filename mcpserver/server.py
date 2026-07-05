@@ -103,10 +103,11 @@ class FlowProxyMCP:
                 "returns the result rows. `metrics` is a list of metric names. "
                 "`group_by` is a list of dimension names (from get_dimensions); for a "
                 "time grain use the `name__grain` form, e.g. 'metric_time__month'. "
-                "`where` is an optional list of MetricFlow filter expressions, e.g. "
-                "\"{{ Dimension('account__region') }} = 'EMEA'\". `order_by` prefixes "
-                "a name with '-' for descending. `limit` caps rows. The metric's own "
-                "aggregation and any semi-additive rules are always enforced."
+                "`where` is an optional list of MetricFlow filter expressions of the "
+                "form \"{{ Dimension('<entity>__<dim>') }} = '<value>'\". `order_by` "
+                "prefixes a name with '-' for descending. `limit` caps rows. The "
+                "metric's own aggregation and any semi-additive rules are always "
+                "enforced."
             ),
         )
         def query_metrics(

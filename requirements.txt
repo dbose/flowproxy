@@ -28,8 +28,11 @@ sqlglot==26.33.0
 
 # --- manifest store (WS7) — fsspec covers s3/gs/az/file/http in one backend --
 fsspec==2026.6.0
-# Enable the extras your store needs (vendored via the internal mirror):
-# s3fs   ==…   # s3://
+# s3fs makes fsspec speak s3://. REQUIRED in the runtime image: STORE mode pulls
+# the bundle AND the DuckDB sidecar from S3, so without this the container
+# crash-loops with "No module named 's3fs'". For gs:// / az:// stores, add the
+# matching driver (gcsfs / adlfs) here too.
+s3fs==2026.6.0
 # gcsfs  ==…   # gs://
 # adlfs  ==…   # az://
 

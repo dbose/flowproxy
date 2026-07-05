@@ -410,7 +410,12 @@ class PostgresProxyServer:
             session.session_id,
             compiled.row_count,
         )
-        return self._reproject(compiled.columns, compiled.rows, extracted.projection)
+        # Use the client's (output_name, semantic_name) mapping so result
+        # columns are labeled with the aliases the driver reads back by.
+        output_columns = extracted.output_columns or [
+            (name, name) for name in extracted.projection
+        ]
+        return self._reproject(compiled.columns, compiled.rows, output_columns)
 
     async def _run_dry_run(
         self, session: SessionState, extracted: ExtractedQuery, loop: asyncio.AbstractEventLoop
@@ -436,14 +441,19 @@ class PostgresProxyServer:
 
     @staticmethod
     def _reproject(
-        columns: list[str], rows: list[tuple[Any, ...]], desired: list[str]
+        columns: list[str],
+        rows: list[tuple[Any, ...]],
+        output_columns: list[tuple[str, str]],
     ) -> QueryResult:
-        """Reorder MetricFlow's output columns to the client's SELECT order.
+        """Reorder + RELABEL MetricFlow's output to the client's SELECT list.
 
-        MetricFlow emits columns as (dimensions, metrics) and may lower-case or
-        grain-suffix names; map by case-insensitive suffix match to the client's
-        requested projection, so QuickSight sees exactly the columns it asked
-        for, in order. Unmatched desired columns are filled from position.
+        ``output_columns`` is the client's ordered (output_name, semantic_name)
+        list. For each item we locate the matching column MetricFlow returned
+        (by semantic_name, case-insensitively, tolerating grain suffixes) and
+        emit it labeled with the CLIENT'S output_name - which for BI tools is a
+        generated alias they read the result set back by. Without relabeling,
+        the driver looks up its alias, finds only the semantic name, and renders
+        NULLs (the QuickSight NULL-NULL bug).
         """
         norm = {c.lower(): i for i, c in enumerate(columns)}
 
@@ -451,26 +461,25 @@ class PostgresProxyServer:
             n = name.lower()
             if n in norm:
                 return norm[n]
-            # MetricFlow may return metric_time as metric_time__month etc.
             for col_lower, idx in norm.items():
                 if col_lower == n or col_lower.startswith(n + "__") or col_lower.endswith("__" + n):
                     return idx
             return None
 
-        order: list[int] = []
+        out_cols: list[str] = []
+        col_indices: list[int | None] = []
         used: set[int] = set()
-        for want in desired:
-            idx = find(want)
-            if idx is not None and idx not in used:
-                order.append(idx)
+        for output_name, semantic_name in output_columns:
+            idx = find(semantic_name)
+            out_cols.append(output_name)          # label with the CLIENT alias
+            col_indices.append(idx)
+            if idx is not None:
                 used.add(idx)
-        # Append any columns MetricFlow returned that weren't matched (safety).
-        for i in range(len(columns)):
-            if i not in used:
-                order.append(i)
 
-        out_cols = [columns[i] for i in order]
-        out_rows = [tuple(row[i] for i in order) for row in rows]
+        def cell(row: tuple[Any, ...], idx: int | None) -> Any:
+            return row[idx] if idx is not None else None
+
+        out_rows = [tuple(cell(row, idx) for idx in col_indices) for row in rows]
         return QueryResult(columns=out_cols, rows=out_rows)
 
     # ------------------------------------------------------------------ #
@@ -536,8 +545,12 @@ class PostgresProxyServer:
                 return
             portal = maybe_portal
 
+        # Row-returning kinds get a RowDescription; everything else NoData.
+        # CATALOG is included: JDBC drivers (QuickSight) issue catalog probes
+        # via the extended protocol and Describe them before Execute - omitting
+        # CATALOG here made the driver see NoData and read zero rows.
         kind = self._extractor.classify(portal.statement.sql)
-        if kind not in (QueryKind.DATA, QueryKind.SHOW, QueryKind.SCALAR):
+        if kind not in (QueryKind.DATA, QueryKind.SHOW, QueryKind.SCALAR, QueryKind.CATALOG):
             writer.write(protocol.no_data())
             return
 
@@ -560,7 +573,7 @@ class PostgresProxyServer:
 
         kind = self._extractor.classify(portal.statement.sql)
         try:
-            if kind in (QueryKind.DATA, QueryKind.SHOW, QueryKind.SCALAR):
+            if kind in (QueryKind.DATA, QueryKind.SHOW, QueryKind.SCALAR, QueryKind.CATALOG):
                 result = await self._materialize_portal(session, portal, kind)
                 for row in result.rows:
                     writer.write(protocol.data_row(row))
@@ -583,6 +596,8 @@ class PostgresProxyServer:
                 portal.result = await self._run_semantic_query(session, portal.statement.sql)
             elif kind is QueryKind.SHOW:
                 portal.result = self._answer_show(portal.statement.sql)
+            elif kind is QueryKind.CATALOG:
+                portal.result = self._answer_catalog(session, portal.statement.sql)
             else:
                 portal.result = self._answer_scalar(portal.statement.sql)
         return portal.result

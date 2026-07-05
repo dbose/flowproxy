@@ -2,8 +2,8 @@
 
 The registry is the single source of truth used to classify incoming SQL
 column tokens as MetricFlow *metrics* or *dimensions*, and to expand bare
-dimension names (``department``) into MetricFlow's entity-qualified form
-(``employee__department``) that the query planner requires.
+dimension names (``<dim>``) into MetricFlow's entity-qualified form
+(``<entity>__<dim>``) that the query planner requires.
 """
 
 from __future__ import annotations
@@ -108,9 +108,9 @@ class SemanticRegistry:
         """Resolve a column token to a MetricFlow group-by name.
 
         Accepts:
-          * qualified names        -> ``employee__department``
-          * bare names             -> ``department``
-          * grain-suffixed names   -> ``metric_time__month`` / ``hired_at__year``
+          * qualified names        -> ``<entity>__<dim>``
+          * bare names             -> ``<dim>``
+          * grain-suffixed names   -> ``metric_time__month`` / ``<time_dim>__year``
 
         Returns the canonical qualified name (grain suffix preserved), or
         ``None`` when the token is not a known dimension.

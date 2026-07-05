@@ -2,7 +2,7 @@
 
 QuickSight speaks plain PostgreSQL to us, e.g.::
 
-    SELECT "turnover_rate", "department" FROM "turnover_cube" GROUP BY 2
+    SELECT "<metric>", "<dimension>" FROM "<cube>" GROUP BY 2
 
 This module parses that dialect with ``sqlglot``, identifies the virtual
 cube in the FROM clause, unwraps each projection down to its column token
@@ -51,6 +51,10 @@ class ExtractedQuery:
     cube: str
     metrics: list[str] = field(default_factory=list)
     dimensions: list[str] = field(default_factory=list)
+    # Ordered (output_name, semantic_name) per SELECT item - the client's exact
+    # column order and the alias it reads results back by (QuickSight generates
+    # a token alias per column). Empty only in legacy/dry-run callers.
+    output_columns: list[tuple[str, str]] = field(default_factory=list)
     # WS2: filters/order/limit translated into MetricFlow constructs.
     where_constraints: list[str] = field(default_factory=list)
     time_constraint_start: "dt.datetime | None" = None
@@ -60,8 +64,25 @@ class ExtractedQuery:
 
     @property
     def projection(self) -> list[str]:
-        """Output column order as the client SELECTed it."""
+        """Semantic column names in the client's SELECT order.
+
+        Prefers output_columns (true SELECT order); falls back to
+        dims-then-metrics only for callers that did not populate it.
+        """
+        if self.output_columns:
+            return [semantic for _, semantic in self.output_columns]
         return [*self.dimensions, *self.metrics]
+
+    @property
+    def output_names(self) -> list[str]:
+        """The names the client reads columns back by (aliases), in SELECT order.
+
+        These are what the wire RowDescription must use - BI tools alias every
+        output column and look the result set up by that alias.
+        """
+        if self.output_columns:
+            return [out for out, _ in self.output_columns]
+        return self.projection
 
 
 # Aggregate wrappers BI tools commonly emit around measures. We unwrap them:
@@ -144,13 +165,34 @@ class SQLExtractor:
             )
 
         cube = self._extract_cube(tree)
-        metrics, dimensions = self._classify_projections(tree)
+        metrics, dimensions, output_columns = self._classify_projections(tree)
+
+        # A semantic query must request at least one metric. QuickSight (and
+        # other BI tools) can emit COUNT(<dimension>) when a visual has no
+        # measure - our parser correctly unwraps the COUNT (aggregation lives in
+        # the metric definition, not the SQL), leaving zero metrics. MetricFlow
+        # cannot plan a metric-less query, so guide the analyst rather than
+        # emit an opaque SQL exception. Matches dbt Cloud's behavior.
+        if not metrics:
+            available = sorted(self._registry.metrics)
+            hint = ", ".join(available[:8]) + ("..." if len(available) > 8 else "")
+            raise UnsupportedQueryError(
+                "this visual has no metric - the semantic layer answers metrics, "
+                "not counts of dimensions",
+                detail=(
+                    f"Add a metric to the visual's Value field (available: {hint}). "
+                    "COUNT of a dimension is not supported; define a count metric in "
+                    "the semantic model if you need one."
+                ),
+            )
+
         clauses = self._translator.translate(tree)  # WS2: WHERE/ORDER/LIMIT
 
         result = ExtractedQuery(
             cube=cube,
             metrics=metrics,
             dimensions=dimensions,
+            output_columns=output_columns,
             where_constraints=clauses.where_constraints,
             time_constraint_start=clauses.time_constraint_start,
             time_constraint_end=clauses.time_constraint_end,
@@ -186,19 +228,34 @@ class SQLExtractor:
             )
         return tables[0].name  # sqlglot strips the double quotes
 
-    def _classify_projections(self, tree: exp.Select) -> tuple[list[str], list[str]]:
+    def _classify_projections(
+        self, tree: exp.Select
+    ) -> tuple[list[str], list[str], list[tuple[str, str]]]:
+        """Return (metrics, dimensions, output_columns).
+
+        ``output_columns`` is an ordered list of (output_name, semantic_name):
+        the name the CLIENT will read the column back by (its ``AS`` alias, or
+        the column text if unaliased) mapped to the resolved semantic name
+        MetricFlow returns. BI tools (QuickSight) alias every output column to a
+        generated token and read the result set back BY THAT ALIAS - so the
+        wire layer must label result columns with output_name, not the semantic
+        name, or the client finds no matching column and renders NULLs.
+        """
         metrics: list[str] = []
         dimensions: list[str] = []
+        output_columns: list[tuple[str, str]] = []
 
         for projection in tree.expressions:
             token = self._unwrap(projection)
             if token is None:
                 continue  # literal constants contribute nothing semantic
+            output_name = self._output_name(projection)
 
             name, grain = token
             if grain is None and self._registry.is_metric(name):
                 if name not in metrics:
                     metrics.append(name)
+                output_columns.append((output_name, name))
                 continue
 
             lookup_name = f"{name}__{grain}" if grain else name
@@ -206,6 +263,7 @@ class SQLExtractor:
             if resolved is not None:
                 if resolved not in dimensions:
                     dimensions.append(resolved)
+                output_columns.append((output_name, resolved))
                 continue
 
             close = self._registry.suggestions(name)
@@ -216,7 +274,15 @@ class SQLExtractor:
 
         if not metrics and not dimensions:
             raise UnsupportedQueryError("query projects no semantic fields")
-        return metrics, dimensions
+        return metrics, dimensions, output_columns
+
+    @staticmethod
+    def _output_name(projection: exp.Expression) -> str:
+        """The name the client reads this column back by: its AS alias if given,
+        else the underlying column name (what sqlglot calls the output name)."""
+        if isinstance(projection, exp.Alias):
+            return projection.alias
+        return projection.alias_or_name or projection.name
 
     def _unwrap(self, node: exp.Expression) -> tuple[str, str | None] | None:
         """Peel a projection down to ``(column_name, optional_time_grain)``.
