@@ -6,10 +6,14 @@
 [![Python](https://img.shields.io/badge/python-3.11%2B-blue.svg)](pyproject.toml)
 [![dbt-core](https://img.shields.io/badge/dbt--core-1.11-orange.svg)](docs/adr/0002-oss-dbt-core-metricflow-stack.md)
 [![MetricFlow](https://img.shields.io/badge/metricflow-0.211-orange.svg)](docs/adr/0002-oss-dbt-core-metricflow-stack.md)
-[![Tests](https://img.shields.io/badge/tests-77%20passing-brightgreen.svg)](tests/)
+[![Tests](https://img.shields.io/badge/tests-93%20passing-brightgreen.svg)](tests/)
 [![Air-gapped](https://img.shields.io/badge/deploy-air--gapped-informational.svg)](#production-deployment)
 
 FlowProxy fills the role of Cube.dev or the dbt Cloud Semantic Layer, built natively on open-source **dbt-core** and **MetricFlow** and running fully **offline**. BI tools connect with their stock **PostgreSQL** connector — no custom driver, no SPICE, no dbt Cloud subscription. An analyst drags metrics and dimensions onto a visual; FlowProxy intercepts the SQL, re-plans it through MetricFlow, executes the optimized query in your warehouse, and streams rows back over the native PostgreSQL wire protocol. An LLM reaches the same semantic layer through an embedded, dbt-mcp-compatible MCP server — and through the same guardrails.
+
+![A dbt-core semantic model sliced live in Amazon QuickSight: account_balance by region showing AMER 3,000 and EMEA 2,000, the semi-additive end-of-period balances](docs/images/quicksight-account-balance.png)
+
+<sub>A dbt-core + MetricFlow semantic layer, sliced by an analyst in Amazon QuickSight over the PostgreSQL wire protocol — running air-gapped on AWS from a CI-published bundle. The `Sum` is QuickSight's; the number is the semi-additive **end-of-period** balance, because the metric's guardrail is enforced at query time (see [The guardrail, proven](#the-guardrail-proven)).</sub>
 
 ---
 
@@ -205,12 +209,20 @@ measures:
       window_choice: max           # take the LAST balance in a period, not the sum
 ```
 
-| Query, grouped by month | `account_balance` (semi-additive) | `naive_balance_total` (naive SUM) |
-|---|---|---|
-| EMEA — Jan / Feb / Mar | **1500 / 1200 / 2000** | 31,500 / ... (about 30x too large) |
-| AMER — Jan / Feb / Mar | **4000 / 4500 / 3000** | 154,000 / ... |
+The semi-additive metric returns the **end-of-period balance**; a BI tool wrapping it in `SUM()` still gets the correct number, because FlowProxy re-plans through the metric definition rather than executing the client's SQL.
 
-The semi-additive metric returns the **end-of-month balance**; a BI tool wrapping it in `SUM()` still gets the correct number, because FlowProxy re-plans through the metric definition rather than executing the client's SQL. This is asserted with exact values in [`tests/test_l3_golden_numbers.py`](tests/test_l3_golden_numbers.py), over a real socket in [`tests/test_ws3_quicksight_e2e.py`](tests/test_ws3_quicksight_e2e.py), and through the LLM path in [`tests/test_ws6_mcp.py`](tests/test_ws6_mcp.py).
+### Seeing it live in QuickSight
+
+Two Amazon QuickSight visuals, built by the same drag-and-drop actions against the same cube, both with a `Sum` aggregation applied by QuickSight. The only difference is which metric is dragged in — and the numbers differ by ~135×, because the guardrail is enforced at query time:
+
+| | |
+|:--:|:--:|
+| ![account_balance (semi-additive) in QuickSight: AMER 3,000 / EMEA 2,000](docs/images/quicksight-account-balance.png) | ![naive_balance_total in QuickSight: AMER 408,500 / EMEA 112,700](docs/images/quicksight-naive-total.png) |
+| **`account_balance`** — the governed, semi-additive metric. End-of-period balances: **AMER 3,000 · EMEA 2,000**. | **`naive_balance_total`** — a naive `SUM` of daily snapshots: AMER 408,500 · EMEA 112,700. Meaningless as a balance. |
+
+The analyst performed the **identical action** in both — dragged the field, left QuickSight's default `Sum`. On the governed metric there is no way to get the wrong number: MetricFlow's `non_additive_dimension` collapses each account's daily series to its end-of-period value, and the BI tool's `SUM()` is unwrapped and re-planned rather than executed. The metric author decided the semantics once, in YAML; no BI tool or analyst can override them.
+
+This is asserted with exact values in [`tests/test_l3_golden_numbers.py`](tests/test_l3_golden_numbers.py), over a real socket in [`tests/test_ws3_quicksight_e2e.py`](tests/test_ws3_quicksight_e2e.py), and through the LLM path in [`tests/test_ws6_mcp.py`](tests/test_ws6_mcp.py). (Grouped by month, the semi-additive metric is 1500/1200/2000 for EMEA and 4000/4500/3000 for AMER; the naive sum is ~30× each.)
 
 ---
 
