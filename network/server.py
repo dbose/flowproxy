@@ -536,8 +536,12 @@ class PostgresProxyServer:
                 return
             portal = maybe_portal
 
+        # Row-returning kinds get a RowDescription; everything else NoData.
+        # CATALOG is included: JDBC drivers (QuickSight) issue catalog probes
+        # via the extended protocol and Describe them before Execute - omitting
+        # CATALOG here made the driver see NoData and read zero rows.
         kind = self._extractor.classify(portal.statement.sql)
-        if kind not in (QueryKind.DATA, QueryKind.SHOW, QueryKind.SCALAR):
+        if kind not in (QueryKind.DATA, QueryKind.SHOW, QueryKind.SCALAR, QueryKind.CATALOG):
             writer.write(protocol.no_data())
             return
 
@@ -560,7 +564,7 @@ class PostgresProxyServer:
 
         kind = self._extractor.classify(portal.statement.sql)
         try:
-            if kind in (QueryKind.DATA, QueryKind.SHOW, QueryKind.SCALAR):
+            if kind in (QueryKind.DATA, QueryKind.SHOW, QueryKind.SCALAR, QueryKind.CATALOG):
                 result = await self._materialize_portal(session, portal, kind)
                 for row in result.rows:
                     writer.write(protocol.data_row(row))
@@ -583,6 +587,8 @@ class PostgresProxyServer:
                 portal.result = await self._run_semantic_query(session, portal.statement.sql)
             elif kind is QueryKind.SHOW:
                 portal.result = self._answer_show(portal.statement.sql)
+            elif kind is QueryKind.CATALOG:
+                portal.result = self._answer_catalog(session, portal.statement.sql)
             else:
                 portal.result = self._answer_scalar(portal.statement.sql)
         return portal.result
