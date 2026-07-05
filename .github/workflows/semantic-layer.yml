@@ -35,7 +35,10 @@ on:
 env:
   DO_NOT_TRACK: "1"
   DBT_SEND_ANONYMOUS_USAGE_STATS: "false"
-  DBT_PROJECT_DIR: test_projects/finance_demo
+  # NOTE: do NOT name this DBT_PROJECT_DIR - dbt reads that reserved env var as
+  # the default for --project-dir and resolves it relative to the working dir,
+  # which collides with the steps' `working-directory` and doubles the path.
+  PROJECT_DIR: test_projects/finance_demo
 
 jobs:
   validate:
@@ -53,15 +56,15 @@ jobs:
       # Parse the MetricFlow YAML into a semantic manifest, using the throwaway
       # DuckDB profile so no warehouse credentials are needed.
       - name: dbt parse
-        working-directory: ${{ env.DBT_PROJECT_DIR }}
+        working-directory: ${{ env.PROJECT_DIR }}
         env:
-          FLOWPROXY_DUCKDB_PATH: ${{ github.workspace }}/${{ env.DBT_PROJECT_DIR }}/target/finance_demo.duckdb
-        run: uv run --project ${{ github.workspace }} dbt parse --profiles-dir .
+          FLOWPROXY_DUCKDB_PATH: ${{ github.workspace }}/${{ env.PROJECT_DIR }}/target/finance_demo.duckdb
+        run: uv run --project ${{ github.workspace }} dbt parse --project-dir . --profiles-dir .
 
       # The gate: plan every saved query + auto-cube via MetricFlow explain.
       # Fails the job (blocks deploy) on a broken join path / renamed dimension.
       - name: Validate gate (no publish)
-        run: uv run python -m flowproxy_cli validate ${{ env.DBT_PROJECT_DIR }}
+        run: uv run python -m flowproxy_cli validate ${{ env.PROJECT_DIR }}
 
   publish:
     name: Publish bundle + DuckDB sidecar to S3
@@ -81,16 +84,16 @@ jobs:
       # Build the DuckDB demo warehouse (seeds + models) - this is the .duckdb
       # sidecar the runtime will query.
       - name: dbt build (demo warehouse)
-        working-directory: ${{ env.DBT_PROJECT_DIR }}
+        working-directory: ${{ env.PROJECT_DIR }}
         env:
-          FLOWPROXY_DUCKDB_PATH: ${{ github.workspace }}/${{ env.DBT_PROJECT_DIR }}/target/finance_demo.duckdb
-        run: uv run --project ${{ github.workspace }} dbt build --profiles-dir .
+          FLOWPROXY_DUCKDB_PATH: ${{ github.workspace }}/${{ env.PROJECT_DIR }}/target/finance_demo.duckdb
+        run: uv run --project ${{ github.workspace }} dbt build --project-dir . --profiles-dir .
 
       - name: dbt parse (manifest)
-        working-directory: ${{ env.DBT_PROJECT_DIR }}
+        working-directory: ${{ env.PROJECT_DIR }}
         env:
-          FLOWPROXY_DUCKDB_PATH: ${{ github.workspace }}/${{ env.DBT_PROJECT_DIR }}/target/finance_demo.duckdb
-        run: uv run --project ${{ github.workspace }} dbt parse --profiles-dir .
+          FLOWPROXY_DUCKDB_PATH: ${{ github.workspace }}/${{ env.PROJECT_DIR }}/target/finance_demo.duckdb
+        run: uv run --project ${{ github.workspace }} dbt parse --project-dir . --profiles-dir .
 
       - name: Configure AWS credentials (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
@@ -102,9 +105,9 @@ jobs:
       # prior bundle exists (treated as non-fatal).
       - name: Validate + publish bundle to S3
         run: |
-          uv run python -m flowproxy_cli validate ${{ env.DBT_PROJECT_DIR }} \
+          uv run python -m flowproxy_cli validate ${{ env.PROJECT_DIR }} \
             --publish "${{ vars.FLOWPROXY_S3_PREFIX }}/manifest/" \
-            --profiles-template ${{ env.DBT_PROJECT_DIR }}/profiles.template.yml \
+            --profiles-template ${{ env.PROJECT_DIR }}/profiles.template.yml \
             --git-sha "${{ github.sha }}" \
             --built-at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
             --diff
@@ -115,7 +118,7 @@ jobs:
         run: |
           uv run python - <<'PY'
           import os, fsspec
-          src = f"{os.environ['GITHUB_WORKSPACE']}/{os.environ['DBT_PROJECT_DIR']}/target/finance_demo.duckdb"
+          src = f"{os.environ['GITHUB_WORKSPACE']}/{os.environ['PROJECT_DIR']}/target/finance_demo.duckdb"
           dst = f"{os.environ['FLOWPROXY_S3_PREFIX']}/warehouse/finance_demo.duckdb"
           size = os.path.getsize(src)
           with open(src, "rb") as r, fsspec.open(dst, "wb") as w:
@@ -123,6 +126,7 @@ jobs:
           print(f"uploaded {size} bytes -> {dst}")
           PY
         env:
+          PROJECT_DIR: ${{ env.PROJECT_DIR }}
           FLOWPROXY_S3_PREFIX: ${{ vars.FLOWPROXY_S3_PREFIX }}
 
       - name: Summary
