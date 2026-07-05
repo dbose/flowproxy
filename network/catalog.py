@@ -89,10 +89,22 @@ def project(rowset: RowSet, sql: str) -> CatalogResult:
         return CatalogResult(columns=list(rowset.columns), rows=list(rowset.rows))
 
     # Build (output_name, source_column | None) for each projected item.
+    rowset_cols_lower = {c.lower(): c for c in rowset.columns}
     plan: list[tuple[str, str | None]] = []
     for e in tree.expressions:
         output_name, source = _projected_column(e)
-        plan.append((output_name, source))
+        # Resolve the source against the RowSet, case-insensitively. For a
+        # non-column projection (CASE/NULL/func) whose source is None, fall back
+        # to matching the OUTPUT alias against a RowSet column - responders
+        # precompute driver-shaped columns (table_type, table_cat, ...) named
+        # after the alias, so e.g. "CASE ... END AS TABLE_TYPE" resolves to the
+        # precomputed table_type column instead of NULL.
+        resolved: str | None = None
+        if source is not None and source.lower() in rowset_cols_lower:
+            resolved = rowset_cols_lower[source.lower()]
+        elif output_name.lower() in rowset_cols_lower:
+            resolved = rowset_cols_lower[output_name.lower()]
+        plan.append((output_name, resolved))
 
     out_cols = [name for name, _ in plan]
     out_rows: list[tuple[Any, ...]] = []
@@ -140,16 +152,20 @@ class CatalogResponder:
 
     def __init__(self, catalog: VirtualCatalog) -> None:
         self._catalog = catalog
-        # Ordered matchers; first hit wins. Each returns a RowSet (projected
-        # onto the client's SELECT list) or a CatalogResult (stubs), or None.
+        # Ordered matchers; first hit wins. ORDER MATTERS: a JDBC getTables()
+        # query joins pg_class AND pg_namespace, so pg_class (the table list)
+        # MUST be checked before pg_namespace (the schema list) - otherwise the
+        # schema-list handler wins and QuickSight gets schemas mislabeled as
+        # tables (empty table dropdown). pg_attribute (getColumns) likewise
+        # before pg_class.
         self._matchers: list[tuple[str, Callable[[str], "RowSet | CatalogResult | None"]]] = [
             ("information_schema.tables", self._answer_is_tables),
             ("information_schema.columns", self._answer_is_columns),
             ("information_schema.schemata", self._answer_is_schemata),
             ("pg_type", self._answer_pg_type_stub),
-            ("pg_namespace", self._answer_pg_namespace),
-            ("pg_class", self._answer_pg_class),
             ("pg_attribute", self._answer_pg_attribute),
+            ("pg_class", self._answer_pg_class),
+            ("pg_namespace", self._answer_pg_namespace),
         ]
 
     def rebind(self, catalog: VirtualCatalog) -> None:
@@ -233,10 +249,46 @@ class CatalogResponder:
         return RowSet(columns=cols, rows=rows)
 
     def _answer_pg_class(self, sql: str) -> RowSet:
-        # relkind 'v' = view; drivers list these as selectable relations.
-        cols = ["oid", "relname", "relnamespace", "relkind", "reltuples"]
-        rows = [(t.table_oid, t.name, 2201, "v", 0) for t in self._visible_tables()]
+        """pg_class-based probes. Two shapes:
+
+        * JDBC getTables(): SELECT ... n.nspname AS TABLE_SCHEM, c.relname AS
+          TABLE_NAME, CASE relkind ... AS TABLE_TYPE FROM pg_class c JOIN
+          pg_namespace n ... WHERE nspname = '<schema>'. Detected by the
+          TABLE_NAME/TABLE_SCHEM projection; returns one row per cube with the
+          columns getTables aliases from, so the projection maps them.
+        * Bare relation list: SELECT oid, relname, relkind FROM pg_class.
+
+        Honors a WHERE nspname = '<schema>' filter so the driver's per-schema
+        listing only returns cubes when it asks for 'semantic_layer'.
+        """
+        schema_filter = self._extract_nspname_filter(sql)
+        visible = self._visible_tables()
+        if schema_filter is not None and schema_filter != CATALOG_SCHEMA:
+            visible = []  # driver asked about a different schema (e.g. public)
+
+        # Rich RowSet: real pg_catalog columns PLUS the getTables output aliases,
+        # so the projection resolves whichever the driver referenced. TABLE_TYPE
+        # is precomputed 'VIEW' (all cubes are views), which matches the driver's
+        # CASE(relkind='v' -> 'VIEW') without us evaluating the CASE.
+        cols = [
+            "oid", "relname", "relnamespace", "relkind", "reltuples",
+            "nspname", "table_cat", "table_schem", "table_name", "table_type",
+        ]
+        rows = [
+            (t.table_oid, t.name, 2201, "v", 0,
+             t.schema, None, t.schema, t.name, "VIEW")
+            for t in visible
+        ]
         return RowSet(columns=cols, rows=rows)
+
+    @staticmethod
+    def _extract_nspname_filter(sql: str) -> str | None:
+        m = re.search(r"nspname\s*(?:=|LIKE)\s*'([^']+)'", sql, re.IGNORECASE)
+        if not m:
+            return None
+        val = m.group(1)
+        # A LIKE 'semantic\_layer' escapes the underscore; normalize.
+        return val.replace("\\", "")
 
     def _answer_pg_attribute(self, sql: str) -> RowSet:
         cols = ["attrelid", "attname", "atttypid", "attnum", "attnotnull", "atttypmod"]

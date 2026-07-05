@@ -117,6 +117,44 @@ def test_information_schema_columns_typed(responder):
     assert {row[ci["table_name"]] for row in r.rows} == {"daily_balances"}
 
 
+def test_gettables_probe_returns_cubes_not_schemas(responder):
+    """The EXACT JDBC getTables() query captured from QuickSight logs.
+
+    It joins pg_class c AND pg_namespace n. Because both tables are named, the
+    matcher order matters: pg_class (table list) must win over pg_namespace
+    (schema list), else QuickSight gets 2 schemas mislabeled as tables and the
+    table dropdown is empty. Regression for exactly that.
+    """
+    gettables = (
+        "SELECT NULL AS TABLE_CAT, n.nspname AS TABLE_SCHEM, c.relname AS TABLE_NAME, "
+        "CASE c.relkind WHEN 'r' THEN 'TABLE' WHEN 'v' THEN 'VIEW' END AS TABLE_TYPE "
+        "FROM pg_catalog.pg_class c "
+        "LEFT JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace "
+        "WHERE c.relkind IN ('r','v') AND n.nspname = 'semantic_layer' "
+        "ORDER BY TABLE_TYPE, TABLE_SCHEM, TABLE_NAME"
+    )
+    r = responder.answer(gettables)
+    assert r.handled
+    assert r.columns == ["TABLE_CAT", "TABLE_SCHEM", "TABLE_NAME", "TABLE_TYPE"]
+    ci = {n: i for i, n in enumerate(r.columns)}
+    names = {row[ci["TABLE_NAME"]] for row in r.rows}
+    assert "daily_balances" in names and "all_metrics" in names   # cubes, not schemas
+    assert "public" not in names and "semantic_layer" not in names  # not schemas
+    assert all(row[ci["TABLE_TYPE"]] == "VIEW" for row in r.rows)
+    assert all(row[ci["TABLE_SCHEM"]] == "semantic_layer" for row in r.rows)
+    assert all(row[ci["TABLE_CAT"]] is None for row in r.rows)
+
+
+def test_gettables_schema_filter_honored(responder):
+    """getTables for a different schema returns no cubes."""
+    r = responder.answer(
+        "SELECT c.relname AS TABLE_NAME FROM pg_class c "
+        "LEFT JOIN pg_namespace n ON n.oid = c.relnamespace "
+        "WHERE n.nspname = 'public'"
+    )
+    assert r.rows == []
+
+
 def test_getschemas_alias_projection(responder):
     """The QuickSight/JDBC getSchemas probe aliases nspname AS schema_name.
 
