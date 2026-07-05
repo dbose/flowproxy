@@ -24,6 +24,9 @@ import re
 from dataclasses import dataclass
 from typing import Any, Callable
 
+import sqlglot
+from sqlglot import expressions as exp
+
 from engine.catalog import CATALOG_SCHEMA, CatalogColumn, CatalogTable, VirtualCatalog
 
 logger = logging.getLogger("flowproxy.network.catalog")
@@ -40,6 +43,77 @@ class CatalogResult:
     @property
     def row_count(self) -> int:
         return len(self.rows)
+
+
+@dataclass(frozen=True)
+class RowSet:
+    """Underlying catalog rows keyed by REAL pg_catalog column names.
+
+    Responders build a RowSet in the natural catalog vocabulary (``nspname``,
+    ``relname``, ``oid`` ...). The projection layer then maps the client's
+    SELECT list onto it, so an aliased probe like ``SELECT nspname AS
+    schema_name`` gets back a single column literally named ``schema_name`` -
+    which is what a JDBC driver's ``getString("schema_name")`` needs. Without
+    this, drivers that read columns by name (QuickSight, most JDBC) find no
+    matching column and report zero schemas/tables (SQLSTATE 02000).
+    """
+
+    columns: list[str]                    # real catalog column names
+    rows: list[tuple[Any, ...]]
+
+    def value(self, row: tuple[Any, ...], col: str) -> Any:
+        try:
+            return row[self.columns.index(col)]
+        except ValueError:
+            return None
+
+
+def project(rowset: RowSet, sql: str) -> CatalogResult:
+    """Map a RowSet onto the client's SELECT projection (names + aliases).
+
+    Returns columns named exactly as the client asked (alias if given, else the
+    source column). ``SELECT *`` or an unparseable projection falls back to the
+    RowSet's own column order. Expressions that reference an unknown catalog
+    column resolve to NULL rather than failing - drivers tolerate NULLs but not
+    missing columns.
+    """
+    try:
+        tree = sqlglot.parse_one(sql, read="postgres")
+    except sqlglot.errors.ParseError:
+        tree = None
+
+    if not isinstance(tree, exp.Select) or any(
+        isinstance(e, exp.Star) for e in tree.expressions
+    ) or not tree.expressions:
+        # No usable projection: return the raw shape.
+        return CatalogResult(columns=list(rowset.columns), rows=list(rowset.rows))
+
+    # Build (output_name, source_column | None) for each projected item.
+    plan: list[tuple[str, str | None]] = []
+    for e in tree.expressions:
+        output_name, source = _projected_column(e)
+        plan.append((output_name, source))
+
+    out_cols = [name for name, _ in plan]
+    out_rows: list[tuple[Any, ...]] = []
+    for row in rowset.rows:
+        out_rows.append(tuple(
+            rowset.value(row, src) if src is not None else None
+            for _, src in plan
+        ))
+    return CatalogResult(columns=out_cols, rows=out_rows)
+
+
+def _projected_column(node: exp.Expression) -> tuple[str, str | None]:
+    """Return (output_name, underlying_catalog_column | None) for a SELECT item."""
+    if isinstance(node, exp.Alias):
+        inner = node.this
+        src = inner.name if isinstance(inner, exp.Column) else None
+        return node.alias, src
+    if isinstance(node, exp.Column):
+        return node.name, node.name
+    # A literal or function projection: name it by its SQL text, value NULL.
+    return node.alias_or_name or node.sql(dialect="postgres"), None
 
 
 # Type OID → information_schema data_type name (what drivers read for coercion).
@@ -66,8 +140,9 @@ class CatalogResponder:
 
     def __init__(self, catalog: VirtualCatalog) -> None:
         self._catalog = catalog
-        # Ordered matchers; first hit wins.
-        self._matchers: list[tuple[str, Callable[[str], CatalogResult | None]]] = [
+        # Ordered matchers; first hit wins. Each returns a RowSet (projected
+        # onto the client's SELECT list) or a CatalogResult (stubs), or None.
+        self._matchers: list[tuple[str, Callable[[str], "RowSet | CatalogResult | None"]]] = [
             ("information_schema.tables", self._answer_is_tables),
             ("information_schema.columns", self._answer_is_columns),
             ("information_schema.schemata", self._answer_is_schemata),
@@ -84,39 +159,52 @@ class CatalogResponder:
     # Dispatch
     # ------------------------------------------------------------------ #
     def answer(self, sql: str) -> CatalogResult:
-        """Return a catalog answer, or an unhandled empty result."""
+        """Return a catalog answer, projected onto the client's SELECT list.
+
+        Each matcher yields a RowSet in real catalog vocabulary; the projection
+        layer maps it to the columns/aliases the client asked for, so JDBC
+        drivers that read results by name (QuickSight) find their columns.
+        """
         lowered = sql.lower()
         for needle, handler in self._matchers:
             if needle in lowered:
                 result = handler(sql)
-                if result is not None:
-                    logger.info(
-                        "catalog probe matched %r → %d rows", needle, result.row_count
-                    )
-                    return result
+                if result is None:
+                    continue
+                # Stubs (pg_type) may return a CatalogResult directly; RowSets
+                # get projected onto the client's SELECT list.
+                if isinstance(result, RowSet):
+                    projected = project(result, sql)
+                else:
+                    projected = result
+                logger.info(
+                    "catalog probe matched %r → %d rows, cols=%s",
+                    needle, projected.row_count, projected.columns,
+                )
+                return projected
         logger.info("catalog probe unrecognized; answering empty set: %r", sql[:160])
         return CatalogResult(columns=["?column?"], rows=[], handled=False)
 
+    # Responders below yield a RowSet in REAL catalog column names; answer()
+    # projects it onto the client's SELECT list. Extra columns commonly probed
+    # by drivers are included so an alias onto any of them resolves.
+
     # ------------------------------------------------------------------ #
-    # information_schema.tables — QuickSight's primary table discovery
+    # information_schema.tables — table discovery
     # ------------------------------------------------------------------ #
-    def _answer_is_tables(self, sql: str) -> CatalogResult:
+    def _answer_is_tables(self, sql: str) -> RowSet:
         cols = ["table_catalog", "table_schema", "table_name", "table_type"]
-        rows = [
-            ("flowproxy", t.schema, t.name, "VIEW")
-            for t in self._visible_tables()
-        ]
-        return CatalogResult(columns=cols, rows=rows)
+        rows = [("flowproxy", t.schema, t.name, "VIEW") for t in self._visible_tables()]
+        return RowSet(columns=cols, rows=rows)
 
     # ------------------------------------------------------------------ #
     # information_schema.columns — column discovery + types
     # ------------------------------------------------------------------ #
-    def _answer_is_columns(self, sql: str) -> CatalogResult:
+    def _answer_is_columns(self, sql: str) -> RowSet:
         cols = [
             "table_catalog", "table_schema", "table_name", "column_name",
             "ordinal_position", "is_nullable", "data_type", "udt_name",
         ]
-        # Honor a table filter if the driver scoped the probe to one cube.
         table_filter = self._extract_table_filter(sql)
         rows: list[tuple[Any, ...]] = []
         for t in self._visible_tables():
@@ -129,32 +217,34 @@ class CatalogResponder:
                     _OID_TO_SQL_TYPE.get(c.type_oid, "character varying"),
                     _OID_TO_UDT.get(c.type_oid, "varchar"),
                 ))
-        return CatalogResult(columns=cols, rows=rows)
+        return RowSet(columns=cols, rows=rows)
 
-    def _answer_is_schemata(self, sql: str) -> CatalogResult:
+    def _answer_is_schemata(self, sql: str) -> RowSet:
         cols = ["catalog_name", "schema_name"]
-        return CatalogResult(columns=cols, rows=[("flowproxy", CATALOG_SCHEMA)])
+        return RowSet(columns=cols, rows=[("flowproxy", CATALOG_SCHEMA)])
 
     # ------------------------------------------------------------------ #
     # pg_catalog probes
     # ------------------------------------------------------------------ #
-    def _answer_pg_namespace(self, sql: str) -> CatalogResult:
-        cols = ["oid", "nspname"]
-        return CatalogResult(columns=cols, rows=[(2200, "public"), (2201, CATALOG_SCHEMA)])
+    def _answer_pg_namespace(self, sql: str) -> RowSet:
+        # Include nspowner - some getSchemas variants project or filter on it.
+        cols = ["oid", "nspname", "nspowner"]
+        rows = [(2200, "public", 10), (2201, CATALOG_SCHEMA, 10)]
+        return RowSet(columns=cols, rows=rows)
 
-    def _answer_pg_class(self, sql: str) -> CatalogResult:
+    def _answer_pg_class(self, sql: str) -> RowSet:
         # relkind 'v' = view; drivers list these as selectable relations.
-        cols = ["oid", "relname", "relnamespace", "relkind"]
-        rows = [(t.table_oid, t.name, 2201, "v") for t in self._visible_tables()]
-        return CatalogResult(columns=cols, rows=rows)
+        cols = ["oid", "relname", "relnamespace", "relkind", "reltuples"]
+        rows = [(t.table_oid, t.name, 2201, "v", 0) for t in self._visible_tables()]
+        return RowSet(columns=cols, rows=rows)
 
-    def _answer_pg_attribute(self, sql: str) -> CatalogResult:
-        cols = ["attrelid", "attname", "atttypid", "attnum", "attnotnull"]
+    def _answer_pg_attribute(self, sql: str) -> RowSet:
+        cols = ["attrelid", "attname", "atttypid", "attnum", "attnotnull", "atttypmod"]
         rows: list[tuple[Any, ...]] = []
         for t in self._visible_tables():
             for c in t.columns:
-                rows.append((t.table_oid, c.name, c.type_oid, c.ordinal + 1, False))
-        return CatalogResult(columns=cols, rows=rows)
+                rows.append((t.table_oid, c.name, c.type_oid, c.ordinal + 1, False, -1))
+        return RowSet(columns=cols, rows=rows)
 
     def _answer_pg_type_stub(self, sql: str) -> CatalogResult | None:
         """Power BI / Npgsql pg_type composite bootstrap — DEFERRED stub.

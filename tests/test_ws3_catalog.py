@@ -107,11 +107,39 @@ def test_information_schema_columns_typed(responder):
         "FROM information_schema.columns WHERE table_name = 'daily_balances'"
     )
     assert r.handled
-    by_col = {row[3]: (row[6], row[7]) for row in r.rows}  # column_name → (data_type, udt)
+    # Projection honored: exactly the SELECTed columns, in order.
+    assert r.columns == ["table_name", "column_name", "ordinal_position", "data_type", "udt_name"]
+    ci = {name: i for i, name in enumerate(r.columns)}
+    by_col = {row[ci["column_name"]]: (row[ci["data_type"]], row[ci["udt_name"]]) for row in r.rows}
     assert by_col["account_balance"] == ("numeric", "numeric")
     assert by_col["account__balance_date"] == ("timestamp without time zone", "timestamp")
     # Only that cube's columns returned (table filter honored).
-    assert {row[2] for row in r.rows} == {"daily_balances"}
+    assert {row[ci["table_name"]] for row in r.rows} == {"daily_balances"}
+
+
+def test_getschemas_alias_projection(responder):
+    """The QuickSight/JDBC getSchemas probe aliases nspname AS schema_name.
+
+    The driver reads getString("schema_name"), so the result MUST expose a
+    column literally named schema_name - not the raw (oid, nspname) shape.
+    Regression for the blank-schema-dropdown / SQLSTATE 02000 bug.
+    """
+    r = responder.answer(
+        "SELECT nspname AS schema_name FROM pg_namespace "
+        "WHERE nspname NOT LIKE 'pg\\_%' ORDER BY schema_name"
+    )
+    assert r.handled
+    assert r.columns == ["schema_name"]              # aliased, single column
+    names = {row[0] for row in r.rows}
+    assert CATALOG_SCHEMA in names                    # 'semantic_layer' visible
+
+
+def test_projection_reorders_and_selects(responder):
+    """A probe selecting a subset in a different order gets exactly that."""
+    r = responder.answer("SELECT relkind, relname FROM pg_class")
+    assert r.columns == ["relkind", "relname"]        # order honored
+    assert all(row[0] == "v" for row in r.rows)       # relkind first now
+    assert "daily_balances" in {row[1] for row in r.rows}
 
 
 def test_pg_class_lists_relations(responder):
