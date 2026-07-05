@@ -1,0 +1,23 @@
+FlowProxy
+Copyright 2026 Debasish Bose
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+--------------------------------------------------------------------------------
+Third-party dependency licensing note
+--------------------------------------------------------------------------------
+
+FlowProxy's own source code is Apache-2.0. However, FlowProxy depends on
+packages under other licenses. Notably:
+
+  * MetricFlow is licensed under the Business Source License 1.1 (BUSL-1.1),
+    not an OSI-approved open-source license. Internal, self-hosted use is
+    generally within the license's intent, but the BUSL restricts offering
+    MetricFlow as a competing hosted/commercial service. If you deploy
+    FlowProxy commercially, review the MetricFlow license and obtain legal
+    sign-off. See https://github.com/dbt-labs/metricflow.
+
+  * dbt-core and dbt-semantic-interfaces are Apache-2.0.
+
+Bundling or redistributing FlowProxy does not relicense its dependencies.
+Each dependency remains under its own license.

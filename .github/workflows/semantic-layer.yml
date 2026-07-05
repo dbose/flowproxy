@@ -1,11 +1,17 @@
-# FlowProxy semantic-layer CI/CD (WS7e, ADR-0013).
+# FlowProxy semantic-layer CI/CD (WS7e + ADR-0016).
 #
-# PRs & pushes:   run the OFFLINE validate gate (no warehouse, no publish).
-# Production release ONLY (a published GitHub Release): validate AND publish the
-#   bundle to the ManifestStore, which the running proxies then hot-swap.
+# validate  : runs on every PR/push - offline, plan-only gate, no warehouse,
+#             no AWS, no publish. Blocks a broken sem_*.yml.
+# publish   : runs ONLY on manual dispatch (workflow_dispatch) - builds the
+#             DuckDB demo warehouse, publishes the manifest bundle to S3, and
+#             uploads the .duckdb sidecar next to it. AWS auth via GitHub OIDC
+#             (no stored keys).
 #
-# The gate is plan-only (MetricFlow explain) — it needs no warehouse credentials,
-# so it runs on every PR safely.
+# Required repo configuration for publish (Settings -> Secrets and variables):
+#   vars.AWS_REGION              e.g. us-east-1
+#   vars.AWS_PUBLISH_ROLE_ARN    IAM role trusting this repo via OIDC
+#   vars.FLOWPROXY_S3_PREFIX     e.g. s3://flowproxy-demo-<acct>/finance
+# The runbook (docs/demo-aws-runbook.md) creates these.
 
 name: semantic-layer
 
@@ -13,23 +19,27 @@ on:
   pull_request:
     paths:
       - "test_projects/**"
-      - "models/**"
       - "**/sem_*.yml"
       - "**/saved_queries.yml"
+      - "flowproxy_cli/**"
+      - "engine/**"
   push:
     branches: [main]
-  release:
-    types: [published]        # ← the ONLY event that publishes to production
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: "Publish bundle + DuckDB sidecar to S3"
+        type: boolean
+        default: true
 
 env:
   DO_NOT_TRACK: "1"
   DBT_SEND_ANONYMOUS_USAGE_STATS: "false"
-  # dbt project under version control (adjust to your repo layout):
   DBT_PROJECT_DIR: test_projects/finance_demo
 
 jobs:
   validate:
-    name: Validate semantic layer (plan-only gate)
+    name: Validate semantic layer (offline plan-only gate)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -40,49 +50,83 @@ jobs:
       - name: Sync deps
         run: uv sync --extra duckdb
 
-      # Parse the MetricFlow YAML into a semantic manifest. Uses a throwaway
-      # DuckDB profile so `dbt parse` runs without production warehouse creds.
+      # Parse the MetricFlow YAML into a semantic manifest, using the throwaway
+      # DuckDB profile so no warehouse credentials are needed.
       - name: dbt parse
         working-directory: ${{ env.DBT_PROJECT_DIR }}
+        env:
+          FLOWPROXY_DUCKDB_PATH: ${{ github.workspace }}/${{ env.DBT_PROJECT_DIR }}/target/finance_demo.duckdb
         run: uv run --project ${{ github.workspace }} dbt parse --profiles-dir .
 
-      # The gate: plan every saved query + auto-cube. Fails the job on any
-      # broken join path / renamed dimension / missing metric.
+      # The gate: plan every saved query + auto-cube via MetricFlow explain.
+      # Fails the job (blocks deploy) on a broken join path / renamed dimension.
       - name: Validate gate (no publish)
-        run: |
-          uv run python -m flowproxy_cli validate ${{ env.DBT_PROJECT_DIR }} --diff
+        run: uv run python -m flowproxy_cli validate ${{ env.DBT_PROJECT_DIR }}
 
   publish:
-    name: Publish bundle to ManifestStore (production release only)
+    name: Publish bundle + DuckDB sidecar to S3
     needs: validate
-    if: github.event_name == 'release'          # ← gate on production release
+    if: github.event_name == 'workflow_dispatch' && inputs.publish
     runs-on: ubuntu-latest
     permissions:
-      id-token: write                            # for OIDC to the object store
+      id-token: write        # for GitHub OIDC -> AWS
+      contents: read
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
-      - run: uv sync --extra duckdb
 
-      - name: dbt parse
+      - name: Sync deps (with S3 backend)
+        run: uv sync --extra duckdb --extra aws
+
+      # Build the DuckDB demo warehouse (seeds + models) - this is the .duckdb
+      # sidecar the runtime will query.
+      - name: dbt build (demo warehouse)
         working-directory: ${{ env.DBT_PROJECT_DIR }}
+        env:
+          FLOWPROXY_DUCKDB_PATH: ${{ github.workspace }}/${{ env.DBT_PROJECT_DIR }}/target/finance_demo.duckdb
+        run: uv run --project ${{ github.workspace }} dbt build --profiles-dir .
+
+      - name: dbt parse (manifest)
+        working-directory: ${{ env.DBT_PROJECT_DIR }}
+        env:
+          FLOWPROXY_DUCKDB_PATH: ${{ github.workspace }}/${{ env.DBT_PROJECT_DIR }}/target/finance_demo.duckdb
         run: uv run --project ${{ github.workspace }} dbt parse --profiles-dir .
 
-      # Assume the object-store role via OIDC (no long-lived keys in CI).
-      # Replace with your cloud's auth action (aws-actions/configure-aws-credentials,
-      # google-github-actions/auth, azure/login, or Artifactory token).
-      # - uses: aws-actions/configure-aws-credentials@v4
-      #   with:
-      #     role-to-assume: ${{ secrets.FLOWPROXY_PUBLISH_ROLE }}
-      #     aws-region: ${{ vars.AWS_REGION }}
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_PUBLISH_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
 
-      - name: Validate + publish bundle
-        env:
-          FLOWPROXY_MANIFEST_URI: ${{ vars.FLOWPROXY_MANIFEST_URI }}   # e.g. s3://bank-artifacts/flowproxy/production/
+      # Validate again and publish the bundle to S3. --diff is safe when no
+      # prior bundle exists (treated as non-fatal).
+      - name: Validate + publish bundle to S3
         run: |
           uv run python -m flowproxy_cli validate ${{ env.DBT_PROJECT_DIR }} \
-            --publish "$FLOWPROXY_MANIFEST_URI" \
+            --publish "${{ vars.FLOWPROXY_S3_PREFIX }}/manifest/" \
             --profiles-template ${{ env.DBT_PROJECT_DIR }}/profiles.template.yml \
             --git-sha "${{ github.sha }}" \
             --built-at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
             --diff
+
+      # Upload the DuckDB sidecar next to the bundle (ADR-0016). Uses the same
+      # OIDC credentials via s3fs.
+      - name: Upload DuckDB sidecar to S3
+        run: |
+          uv run python - <<'PY'
+          import os, fsspec
+          src = f"{os.environ['GITHUB_WORKSPACE']}/{os.environ['DBT_PROJECT_DIR']}/target/finance_demo.duckdb"
+          dst = f"{os.environ['FLOWPROXY_S3_PREFIX']}/warehouse/finance_demo.duckdb"
+          size = os.path.getsize(src)
+          with open(src, "rb") as r, fsspec.open(dst, "wb") as w:
+              w.write(r.read())
+          print(f"uploaded {size} bytes -> {dst}")
+          PY
+        env:
+          FLOWPROXY_S3_PREFIX: ${{ vars.FLOWPROXY_S3_PREFIX }}
+
+      - name: Summary
+        run: |
+          echo "Published to ${{ vars.FLOWPROXY_S3_PREFIX }}" >> $GITHUB_STEP_SUMMARY
+          echo "- bundle:    ${{ vars.FLOWPROXY_S3_PREFIX }}/manifest/current.tar" >> $GITHUB_STEP_SUMMARY
+          echo "- warehouse: ${{ vars.FLOWPROXY_S3_PREFIX }}/warehouse/finance_demo.duckdb" >> $GITHUB_STEP_SUMMARY

@@ -24,6 +24,11 @@ duckdb = [
     "dbt-duckdb>=1.9,<1.12",
     "duckdb>=1.1",
 ]
+# S3-backed ManifestStore (WS7/ADR-0016). fsspec + the s3 driver, so
+# `open_store("s3://...")` and the entrypoint's sidecar download work.
+aws = [
+    "s3fs>=2026.6.0",
+]
 
 [dependency-groups]
 dev = [
