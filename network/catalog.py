@@ -141,6 +141,20 @@ _OID_TO_UDT: dict[int, str] = {
     20: "int8", 701: "float8", 1700: "numeric",
     1043: "varchar", 1082: "date", 1114: "timestamp",
 }
+# OID -> java.sql.Types int, for JDBC getColumns()'s DATA_TYPE column.
+# (BIGINT=-5, DOUBLE=8, NUMERIC=2, VARCHAR=12, DATE=91, TIMESTAMP=93)
+_OID_TO_JDBC_TYPE: dict[int, int] = {
+    20: -5, 701: 8, 1700: 2, 1043: 12, 1082: 91, 1114: 93,
+}
+
+# Column names the pg_attribute RowSet carries: raw pg_attribute + the JDBC
+# getColumns() output shape, so the projection resolves either.
+_PG_ATTRIBUTE_COLS: list[str] = [
+    "attrelid", "attname", "atttypid", "attnum", "attnotnull", "atttypmod",
+    "table_cat", "table_schem", "table_name", "column_name",
+    "data_type", "type_name", "column_size", "nullable", "is_nullable",
+    "ordinal_position", "remarks",
+]
 
 
 class CatalogResponder:
@@ -283,20 +297,104 @@ class CatalogResponder:
 
     @staticmethod
     def _extract_nspname_filter(sql: str) -> str | None:
-        m = re.search(r"nspname\s*(?:=|LIKE)\s*'([^']+)'", sql, re.IGNORECASE)
-        if not m:
-            return None
-        val = m.group(1)
-        # A LIKE 'semantic\_layer' escapes the underscore; normalize.
-        return val.replace("\\", "")
+        """Find the schema the driver is restricting to, from the WHERE clause.
+
+        Must look ONLY at the WHERE clause: a getTables() query also contains
+        ``n.nspname = 'information_schema'`` inside the TABLE_TYPE CASE
+        expression, and a naive whole-query regex grabs that first and wrongly
+        concludes the driver wants 'information_schema' (-> 0 cubes).
+
+        Returns the target schema name, or None if the query has no positive
+        nspname equality/LIKE filter in its WHERE (in which case all cubes are
+        returned). Negative filters (``<>``, ``!~``, ``NOT LIKE``) are ignored -
+        they exclude system schemas, not our cube schema.
+        """
+        try:
+            tree = sqlglot.parse_one(sql, read="postgres")
+        except sqlglot.errors.ParseError:
+            tree = None
+
+        where = tree.args.get("where") if isinstance(tree, exp.Select) else None
+        if where is None:
+            # No WHERE parsed: fall back to a WHERE-scoped regex if possible.
+            return CatalogResponder._nspname_regex_after_where(sql)
+
+        # Walk only positive equality/LIKE comparisons on nspname in the WHERE.
+        candidates: list[str] = []
+        for node in where.walk():
+            if isinstance(node, (exp.EQ, exp.Like)):
+                col = node.this
+                val = node.expression
+                col_name = col.name if isinstance(col, exp.Column) else None
+                if col_name == "nspname" and isinstance(val, exp.Literal) and val.is_string:
+                    candidates.append(val.this.replace("\\", ""))
+        # Prefer our own schema if it appears; else the first positive filter.
+        if CATALOG_SCHEMA in candidates:
+            return CATALOG_SCHEMA
+        return candidates[0] if candidates else None
+
+    @staticmethod
+    def _nspname_regex_after_where(sql: str) -> str | None:
+        idx = sql.lower().rfind(" where ")
+        scope = sql[idx:] if idx >= 0 else sql
+        m = re.search(r"nspname\s*(?:=|LIKE)\s*'([^']+)'", scope, re.IGNORECASE)
+        return m.group(1).replace("\\", "") if m else None
 
     def _answer_pg_attribute(self, sql: str) -> RowSet:
-        cols = ["attrelid", "attname", "atttypid", "attnum", "attnotnull", "atttypmod"]
+        """pg_attribute-based probes, principally JDBC getColumns().
+
+        Emits both the raw pg_attribute columns AND the getColumns output
+        columns (table_schem, table_name, column_name, data_type, type_name,
+        column_size, nullable, ordinal_position, is_nullable, ...), so the
+        projection resolves whichever the driver aliased. Honors the schema
+        filter (nspname, WHERE-scoped) and the per-table filter (relname), so
+        getColumns for one cube returns only that cube's columns.
+        """
+        schema_filter = self._extract_nspname_filter(sql)
+        if schema_filter is not None and schema_filter != CATALOG_SCHEMA:
+            return RowSet(columns=_PG_ATTRIBUTE_COLS, rows=[])
+        table_filter = self._extract_relname_filter(sql)
+
         rows: list[tuple[Any, ...]] = []
         for t in self._visible_tables():
+            if table_filter and t.name != table_filter:
+                continue
             for c in t.columns:
-                rows.append((t.table_oid, c.name, c.type_oid, c.ordinal + 1, False, -1))
-        return RowSet(columns=cols, rows=rows)
+                nullable = 1  # java.sql.DatabaseMetaData.columnNullable
+                rows.append((
+                    # raw pg_attribute
+                    t.table_oid, c.name, c.type_oid, c.ordinal + 1, False, -1,
+                    # getColumns output shape
+                    None, t.schema, t.name, c.name,
+                    _OID_TO_JDBC_TYPE.get(c.type_oid, 12),           # data_type (java.sql.Types)
+                    _OID_TO_UDT.get(c.type_oid, "varchar"),          # type_name
+                    None,                                            # column_size (NULL = driver default)
+                    nullable,                                        # nullable (int)
+                    "YES",                                           # is_nullable
+                    c.ordinal + 1,                                   # ordinal_position
+                    c.description,                                   # remarks
+                ))
+        return RowSet(columns=_PG_ATTRIBUTE_COLS, rows=rows)
+
+    @staticmethod
+    def _extract_relname_filter(sql: str) -> str | None:
+        """The per-table filter from a getColumns WHERE (c.relname = '<cube>')."""
+        try:
+            tree = sqlglot.parse_one(sql, read="postgres")
+        except sqlglot.errors.ParseError:
+            tree = None
+        where = tree.args.get("where") if isinstance(tree, exp.Select) else None
+        scope = where if where is not None else tree
+        if scope is None:
+            return None
+        for node in scope.walk():
+            if isinstance(node, (exp.EQ, exp.Like)):
+                col = node.this
+                val = node.expression
+                if isinstance(col, exp.Column) and col.name == "relname" \
+                        and isinstance(val, exp.Literal) and val.is_string:
+                    return val.this.replace("\\", "")
+        return None
 
     def _answer_pg_type_stub(self, sql: str) -> CatalogResult | None:
         """Power BI / Npgsql pg_type composite bootstrap — DEFERRED stub.
