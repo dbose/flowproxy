@@ -165,10 +165,18 @@ _PG_SETTINGS_DEFAULTS: dict[str, str] = {
 }
 
 
-# Column names the pg_attribute RowSet carries: raw pg_attribute + the JDBC
-# getColumns() output shape, so the projection resolves either.
+# Column names the pg_attribute RowSet carries. Covers three getColumns
+# variants a JDBC driver may emit, so `project()` (including SELECT * over the
+# subquery) resolves whatever the query names:
+#   1. raw pg_attribute / pg_class / pg_namespace / pg_type columns the real
+#      windowed getColumns projects (nspname, relname, attname, attidentity, ...)
+#   2. the simpler getColumns output aliases (table_schem, column_name, ...)
 _PG_ATTRIBUTE_COLS: list[str] = [
-    "attrelid", "attname", "atttypid", "attnum", "attnotnull", "atttypmod",
+    # raw catalog columns the windowed getColumns() subquery selects
+    "nspname", "relname", "attrelid", "attname", "atttypid", "attnotnull",
+    "atttypmod", "attlen", "typtypmod", "attnum", "attidentity", "attgenerated",
+    "adsrc", "description", "typbasetype", "typtype", "attisdropped",
+    # simpler getColumns output aliases
     "table_cat", "table_schem", "table_name", "column_name",
     "data_type", "type_name", "column_size", "nullable", "is_nullable",
     "ordinal_position", "remarks",
@@ -328,35 +336,43 @@ class CatalogResponder:
         returned). Negative filters (``<>``, ``!~``, ``NOT LIKE``) are ignored -
         they exclude system schemas, not our cube schema.
         """
-        try:
-            tree = sqlglot.parse_one(sql, read="postgres")
-        except sqlglot.errors.ParseError:
-            tree = None
-
-        where = tree.args.get("where") if isinstance(tree, exp.Select) else None
-        if where is None:
-            # No WHERE parsed: fall back to a WHERE-scoped regex if possible.
-            return CatalogResponder._nspname_regex_after_where(sql)
-
-        # Walk only positive equality/LIKE comparisons on nspname in the WHERE.
-        candidates: list[str] = []
-        for node in where.walk():
-            if isinstance(node, (exp.EQ, exp.Like)):
-                col = node.this
-                val = node.expression
-                col_name = col.name if isinstance(col, exp.Column) else None
-                if col_name == "nspname" and isinstance(val, exp.Literal) and val.is_string:
-                    candidates.append(val.this.replace("\\", ""))
+        candidates = CatalogResponder._positive_filter_values(sql, "nspname")
+        if candidates is None:  # unparseable: fall back to a WHERE-scoped regex
+            m = CatalogResponder._regex_after_where(sql, "nspname")
+            return m
         # Prefer our own schema if it appears; else the first positive filter.
         if CATALOG_SCHEMA in candidates:
             return CATALOG_SCHEMA
         return candidates[0] if candidates else None
 
     @staticmethod
-    def _nspname_regex_after_where(sql: str) -> str | None:
+    def _positive_filter_values(sql: str, column: str) -> list[str] | None:
+        """Positive =/LIKE literal values for ``column`` across ALL WHERE
+        clauses in the query (handles filters nested in a subquery's WHERE, as
+        the windowed getColumns() emits). Returns None if the SQL won't parse.
+
+        Only WHERE clauses are inspected, so a ``nspname = 'information_schema'``
+        living in a SELECT-list CASE expression is never mistaken for a filter.
+        """
+        try:
+            tree = sqlglot.parse_one(sql, read="postgres")
+        except sqlglot.errors.ParseError:
+            return None
+        values: list[str] = []
+        for where in tree.find_all(exp.Where):
+            for node in where.walk():
+                if isinstance(node, (exp.EQ, exp.Like)):
+                    col, val = node.this, node.expression
+                    name = col.name if isinstance(col, exp.Column) else None
+                    if name == column and isinstance(val, exp.Literal) and val.is_string:
+                        values.append(val.this.replace("\\", ""))
+        return values
+
+    @staticmethod
+    def _regex_after_where(sql: str, column: str) -> str | None:
         idx = sql.lower().rfind(" where ")
         scope = sql[idx:] if idx >= 0 else sql
-        m = re.search(r"nspname\s*(?:=|LIKE)\s*'([^']+)'", scope, re.IGNORECASE)
+        m = re.search(rf"{column}\s*(?:=|LIKE)\s*'([^']+)'", scope, re.IGNORECASE)
         return m.group(1).replace("\\", "") if m else None
 
     def _answer_pg_attribute(self, sql: str) -> RowSet:
@@ -379,41 +395,38 @@ class CatalogResponder:
             if table_filter and t.name != table_filter:
                 continue
             for c in t.columns:
-                nullable = 1  # java.sql.DatabaseMetaData.columnNullable
-                rows.append((
-                    # raw pg_attribute
-                    t.table_oid, c.name, c.type_oid, c.ordinal + 1, False, -1,
-                    # getColumns output shape
-                    None, t.schema, t.name, c.name,
-                    _OID_TO_JDBC_TYPE.get(c.type_oid, 12),           # data_type (java.sql.Types)
-                    _OID_TO_UDT.get(c.type_oid, "varchar"),          # type_name
-                    None,                                            # column_size (NULL = driver default)
-                    nullable,                                        # nullable (int)
-                    "YES",                                           # is_nullable
-                    c.ordinal + 1,                                   # ordinal_position
-                    c.description,                                   # remarks
-                ))
+                ordinal = c.ordinal + 1
+                udt = _OID_TO_UDT.get(c.type_oid, "varchar")
+                # Build by column name (order-safe against _PG_ATTRIBUTE_COLS).
+                values: dict[str, Any] = {
+                    # raw catalog columns the windowed getColumns() selects
+                    "nspname": t.schema, "relname": t.name,
+                    "attrelid": t.table_oid, "attname": c.name,
+                    "atttypid": c.type_oid, "attnotnull": False,
+                    "atttypmod": -1, "attlen": -1, "typtypmod": -1,
+                    "attnum": ordinal,                # already row_number()-style 1-based
+                    "attidentity": None, "attgenerated": None,
+                    "adsrc": None, "description": c.description,
+                    "typbasetype": 0, "typtype": "b", "attisdropped": False,
+                    # simpler getColumns output aliases
+                    "table_cat": None, "table_schem": t.schema,
+                    "table_name": t.name, "column_name": c.name,
+                    "data_type": _OID_TO_JDBC_TYPE.get(c.type_oid, 12),
+                    "type_name": udt, "column_size": None,
+                    "nullable": 1, "is_nullable": "YES",
+                    "ordinal_position": ordinal, "remarks": c.description,
+                }
+                rows.append(tuple(values[col] for col in _PG_ATTRIBUTE_COLS))
         return RowSet(columns=_PG_ATTRIBUTE_COLS, rows=rows)
 
     @staticmethod
     def _extract_relname_filter(sql: str) -> str | None:
-        """The per-table filter from a getColumns WHERE (c.relname = '<cube>')."""
-        try:
-            tree = sqlglot.parse_one(sql, read="postgres")
-        except sqlglot.errors.ParseError:
-            tree = None
-        where = tree.args.get("where") if isinstance(tree, exp.Select) else None
-        scope = where if where is not None else tree
-        if scope is None:
-            return None
-        for node in scope.walk():
-            if isinstance(node, (exp.EQ, exp.Like)):
-                col = node.this
-                val = node.expression
-                if isinstance(col, exp.Column) and col.name == "relname" \
-                        and isinstance(val, exp.Literal) and val.is_string:
-                    return val.this.replace("\\", "")
-        return None
+        """The per-table filter (c.relname = '<cube>') from any WHERE clause,
+        including the inner WHERE of a windowed getColumns() subquery."""
+        vals = CatalogResponder._positive_filter_values(sql, "relname")
+        if vals is None:
+            return CatalogResponder._regex_after_where(sql, "relname")
+        return vals[0] if vals else None
 
     def _answer_pg_settings(self, sql: str) -> RowSet:
         """pg_catalog.pg_settings lookups (SELECT setting FROM pg_settings

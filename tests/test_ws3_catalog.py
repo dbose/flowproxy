@@ -295,3 +295,47 @@ def test_pg_settings_unknown_returns_one_row(responder):
     r = responder.answer("SELECT setting FROM pg_settings WHERE name='some_guc'")
     assert r.handled
     assert len(r.rows) == 1
+
+
+# The REAL windowed getColumns() the PG JDBC driver actually sends:
+# SELECT * FROM (SELECT ... row_number() OVER (PARTITION BY a.attrelid ...)
+# ... pg_attribute ...). Wrapped subquery + window function + attidentity/
+# attgenerated. Distinct from the simpler getColumns form.
+_WINDOWED_GETCOLUMNS = """SELECT * FROM (
+  SELECT n.nspname, c.relname, a.attname, a.atttypid,
+         a.attnotnull OR (t.typtype = 'd' AND t.typnotnull) AS attnotnull,
+         a.atttypmod, a.attlen, t.typtypmod,
+         row_number() OVER (PARTITION BY a.attrelid ORDER BY a.attnum) AS attnum,
+         nullif(a.attidentity,'') as attidentity,
+         nullif(a.attgenerated,'') as attgenerated,
+         dsc.description, t.typbasetype, t.typtype
+  FROM pg_catalog.pg_namespace n
+    JOIN pg_catalog.pg_class c ON (c.relnamespace = n.oid)
+    JOIN pg_catalog.pg_attribute a ON (a.attrelid = c.oid)
+    JOIN pg_catalog.pg_type t ON (a.atttypid = t.oid)
+  WHERE c.relkind in ('r','p','v','f','m') AND a.attnum > 0 AND NOT a.attisdropped
+    AND n.nspname LIKE '{schema}' AND c.relname LIKE '{cube}'
+) c WHERE true ORDER BY nspname, c.relname, attnum"""
+
+
+def test_windowed_getcolumns_has_all_driver_read_fields(responder):
+    """The real windowed getColumns (SELECT * over a row_number() subquery).
+    SELECT * means the driver reads the subquery's columns by name, so the
+    RowSet must carry nspname/relname/attname/attidentity/attgenerated/attnum."""
+    r = responder.answer(_WINDOWED_GETCOLUMNS.format(schema="semantic_layer", cube="daily_balances"))
+    assert r.handled
+    for needed in ("nspname", "relname", "attname", "atttypid",
+                   "attnotnull", "attnum", "attidentity", "attgenerated"):
+        assert needed in r.columns, f"driver reads {needed} by name, missing"
+    ci = {n: i for i, n in enumerate(r.columns)}
+    tables = {row[ci["relname"]] for row in r.rows}
+    assert tables == {"daily_balances"}          # per-table filter honored
+    colnames = {row[ci["attname"]] for row in r.rows}
+    assert "account_balance" in colnames
+    # attnum is 1-based ordinal (row_number semantics)
+    assert sorted(row[ci["attnum"]] for row in r.rows) == list(range(1, len(r.rows) + 1))
+
+
+def test_windowed_getcolumns_other_schema_empty(responder):
+    r = responder.answer(_WINDOWED_GETCOLUMNS.format(schema="public", cube="daily_balances"))
+    assert r.rows == []
