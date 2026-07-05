@@ -2,7 +2,7 @@
 
 QuickSight speaks plain PostgreSQL to us, e.g.::
 
-    SELECT "turnover_rate", "department" FROM "turnover_cube" GROUP BY 2
+    SELECT "<metric>", "<dimension>" FROM "<cube>" GROUP BY 2
 
 This module parses that dialect with ``sqlglot``, identifies the virtual
 cube in the FROM clause, unwraps each projection down to its column token

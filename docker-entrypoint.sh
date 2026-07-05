@@ -19,14 +19,16 @@ log() { echo "[entrypoint] $*"; }
 #
 # IMPORTANT: DuckDB derives its CATALOG (database) name from the file's
 # basename. MetricFlow's compiled SQL references that catalog by name (e.g.
-# finance_demo.main.fct_...), so the downloaded sidecar MUST keep the same
-# basename it had when the manifest was built - finance_demo.duckdb - or every
-# query fails with 'Catalog "finance_demo" does not exist'. Default the local
-# path's basename to the sidecar's basename.
+# <project>.main.fct_...), so the downloaded sidecar MUST keep the same basename
+# it had when the manifest was built - otherwise every query fails with
+# 'Catalog "<name>" does not exist'. We therefore derive the local basename from
+# the sidecar URI's basename, so this works for any project, not a fixed name.
 if [[ -z "${FLOWPROXY_DUCKDB_PATH:-}" && -n "${FLOWPROXY_DUCKDB_URI:-}" ]]; then
     FLOWPROXY_DUCKDB_PATH="/app/data/$(basename "${FLOWPROXY_DUCKDB_URI}")"
 fi
-: "${FLOWPROXY_DUCKDB_PATH:=/app/data/finance_demo.duckdb}"
+# Fallback only when neither var is set (e.g. a non-DuckDB warehouse where the
+# sidecar mechanism is unused). Generic name; the derived basename above wins.
+: "${FLOWPROXY_DUCKDB_PATH:=/app/data/warehouse.duckdb}"
 export FLOWPROXY_DUCKDB_PATH
 
 download_sidecar() {
